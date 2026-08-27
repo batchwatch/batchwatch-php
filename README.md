@@ -13,22 +13,19 @@ stream contexts, so it runs on a bare PHP with no extra modules.
 
 ## Install
 
-Not published to Packagist yet. Until it is, either point Composer at the
-subdirectory, or `require` the bootstrap directly.
-
-**With Composer** (from a `composer.json` that references this repo):
-
-```json
-{
-  "autoload": { "psr-4": { "Batchwatch\\": "clients/php/src/" }, "files": ["clients/php/src/functions.php"] }
-}
+```bash
+composer require batchwatch/batchwatch
 ```
 
-**Without Composer** — vendor the four files under `src/` and require the
-bootstrap; they have no third-party imports:
+Zero runtime dependencies — just PHP >= 8.2 and the built-in `json`. It does
+**not** need the `curl` extension: all HTTP goes through PHP stream contexts,
+so it runs on a bare PHP with no extra modules.
+
+**Without Composer** — the client has no third-party imports, so vendor the
+files under `src/` and require the bootstrap directly:
 
 ```php
-require __DIR__ . '/clients/php/bootstrap.php';
+require __DIR__ . '/bootstrap.php';
 ```
 
 A client you have to run `composer install` to try is a client nobody tries,
