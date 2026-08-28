@@ -2,43 +2,43 @@
 
 declare(strict_types=1);
 
-// Koerer alle tre testsuiter i separate processer og samler resultatet.
+// Runs all suites in separate processes and collects the result.
 //
-// Hver suite koerer i sin egen PHP-proces, saa en suite der forker servere
-// ikke kan forstyrre en anden. run.php slutter med exit-kode 0 kun hvis ALLE
-// suiter er groenne.
+// Each suite runs in its own PHP process, so a suite that forks servers cannot
+// disturb another. run.php exits with code 0 only if ALL suites are green.
 //
-// Brug:  php tests/run.php
+// Use:  php tests/run.php
 
-$suiter = [
+$suites = [
     __DIR__ . '/test_fail_open.php',
     __DIR__ . '/test_no_content.php',
     __DIR__ . '/test_spool.php',
     __DIR__ . '/test_verdict_accuracy.php',
+    __DIR__ . '/test_idempotency.php',
 ];
 
 $php = PHP_BINARY;
-$fejlet = 0;
-$bestaaedeSuiter = 0;
+$failed = 0;
+$passedSuites = 0;
 
-foreach ($suiter as $suite) {
-    $kode = 0;
-    passthru(escapeshellarg($php) . ' ' . escapeshellarg($suite), $kode);
-    if ($kode === 0) {
-        $bestaaedeSuiter++;
+foreach ($suites as $suite) {
+    $code = 0;
+    passthru(escapeshellarg($php) . ' ' . escapeshellarg($suite), $code);
+    if ($code === 0) {
+        $passedSuites++;
     } else {
-        $fejlet++;
+        $failed++;
     }
 }
 
-$ialt = count($suiter);
+$total = count($suites);
 fwrite(STDOUT, "\n================================\n");
 fwrite(STDOUT, sprintf(
-    "I ALT: %d/%d suiter groenne%s\n",
-    $bestaaedeSuiter,
-    $ialt,
-    $fejlet === 0 ? ' - ALT BESTAAET' : " - {$fejlet} FEJLEDE",
+    "TOTAL: %d/%d suites green%s\n",
+    $passedSuites,
+    $total,
+    $failed === 0 ? ' - ALL PASSED' : " - {$failed} FAILED",
 ));
 fwrite(STDOUT, "================================\n");
 
-exit($fejlet === 0 ? 0 : 1);
+exit($failed === 0 ? 0 : 1);

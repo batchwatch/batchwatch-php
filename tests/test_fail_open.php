@@ -2,20 +2,21 @@
 
 declare(strict_types=1);
 
-// Det vigtigste krav: et batchwatch-udfald maa aldrig stoppe brugerens job.
+// The most important requirement: a batchwatch outage must never stop the
+// user's job.
 //
-// Testene her koerer mod en port ingen lytter paa, og mod en socket der lytter
-// men aldrig svarer. Ingen af delene maa kunne maerkes af kalderen - hverken
-// som en undtagelse eller som en ventetid der betyder noget.
+// The tests here run against a port no one listens on, and against a socket
+// that listens but never answers. Neither may be noticeable to the caller -
+// neither as an exception nor as a wait that matters.
 //
-// Note om PHP-idiomet: Python/Ruby laegger afsendelsen paa en baggrundstraad,
-// saa kalderens traad slet ikke roeres. PHP CLI har ingen traade, saa
-// afsendelsen er synkron - men bundet af timeouten og pakket saa ingen fejl
-// slipper ud. Kalderen betaler dermed hoejst timeouten pr. kald i vaerste
-// fald, aldrig en hang og aldrig en exception. Timeout-loftet i testene tager
-// derfor hoejde for at BAADE start- OG done-kaldet loeber synkront mod en
-// doed server (2x timeouten), i modsaetning til traad-klienterne hvor blokken
-// stort set er gratis.
+// Note on the PHP idiom: Python/Ruby put the submission on a background thread,
+// so the caller's thread is not touched at all. PHP CLI has no threads, so the
+// submission is synchronous - but bounded by the timeout and wrapped so no
+// error escapes. The caller thus pays at most the timeout per call in the worst
+// case, never a hang and never an exception. The timeout cap in the tests
+// therefore accounts for BOTH the start AND the done call running synchronously
+// against a dead server (2x the timeout), unlike the thread clients where the
+// block is essentially free.
 
 require_once __DIR__ . '/Harness.php';
 require_once __DIR__ . '/TestHelper.php';
@@ -25,127 +26,127 @@ use Batchwatch\HttpError;
 
 $h = new Harness('fail_open');
 
-$h->test('track kaster ikke naar serveren er vaek', function (Harness $t): void {
-    reneOmgivelser();
-    $bw = new Client(baseUrl: lukketPort(), timeout: 0.5);
-    $resultat = null;
-    $bw->track('gpt-5.6-sol', inputTokens: 10, blok: function ($tr) use (&$resultat): void {
-        $resultat = 2 + 2;
+$h->test('track does not throw when the server is gone', function (Harness $t): void {
+    cleanEnv();
+    $bw = new Client(baseUrl: closedPort(), timeout: 0.5);
+    $result = null;
+    $bw->track('gpt-5.6-sol', inputTokens: 10, block: function ($tr) use (&$result): void {
+        $result = 2 + 2;
         $tr->done(outputTokens: 5);
     });
-    $t->assertEquals(4, $resultat);
+    $t->assertEquals(4, $result);
     $t->assertTrue($bw->flush(timeout: 5.0));
 });
 
-$h->test('track er hurtig naar serveren haenger', function (Harness $t): void {
-    // Blokerer klienten paa netvaerket, betaler brugeren for vores nedbrud.
-    // I PHP loeber start+done synkront, saa loftet er ~2x timeouten plus lidt
-    // slack - stadig langt fra en aegte hang, og stadig bundet af fristen.
-    reneOmgivelser();
-    $sorthul = new SortHul();
+$h->test('track is fast when the server hangs', function (Harness $t): void {
+    // If the client blocks on the network, the user pays for our outage. In PHP
+    // start+done run synchronously, so the cap is ~2x the timeout plus a little
+    // slack - still far from a real hang, and still bounded by the deadline.
+    cleanEnv();
+    $blackhole = new BlackHole();
     try {
-        $bw = new Client(baseUrl: $sorthul->url, timeout: 0.5);
+        $bw = new Client(baseUrl: $blackhole->url, timeout: 0.5);
         $t0 = microtime(true);
-        $bw->track('gpt-5.6-sol', inputTokens: 10, blok: function ($tr): void {
+        $bw->track('gpt-5.6-sol', inputTokens: 10, block: function ($tr): void {
             $tr->done(outputTokens: 5);
         });
-        $brugt = microtime(true) - $t0;
-        // 2 kald x 0.5 s timeout = ~1.0 s vaerste fald; loftet er rundhaandet.
-        $t->assertLessThan(2.0, $brugt, sprintf('track() blokerede %.2f s', $brugt));
+        $elapsed = microtime(true) - $t0;
+        // 2 calls x 0.5 s timeout = ~1.0 s worst case; the cap is generous.
+        $t->assertLessThan(2.0, $elapsed, sprintf('track() blocked %.2f s', $elapsed));
     } finally {
-        $sorthul->luk();
+        $blackhole->close();
     }
 });
 
-$h->test('brugerens egen undtagelse slipper igennem', function (Harness $t): void {
-    // Vi sluger vores egne fejl - aldrig kalderens.
-    reneOmgivelser();
-    $bw = new Client(baseUrl: lukketPort(), timeout: 0.5);
+$h->test("the caller's own exception passes through", function (Harness $t): void {
+    // We swallow our own errors - never the caller's.
+    cleanEnv();
+    $bw = new Client(baseUrl: closedPort(), timeout: 0.5);
     $t->assertThrows(DivisionByZeroError::class, function () use ($bw): void {
-        $bw->track('gpt-5.6-sol', inputTokens: 10, blok: function ($tr): void {
+        $bw->track('gpt-5.6-sol', inputTokens: 10, block: function ($tr): void {
             intdiv(1, 0);
         });
     });
     $bw->flush(timeout: 5.0);
 });
 
-$h->test('should_batch giver kalderens default tilbage', function (Harness $t): void {
-    reneOmgivelser();
-    $bw = new Client(baseUrl: lukketPort(), timeout: 0.5);
+$h->test("should_batch gives the caller's default back", function (Harness $t): void {
+    cleanEnv();
+    $bw = new Client(baseUrl: closedPort(), timeout: 0.5);
     $t->assertFalse($bw->shouldBatch('gpt-5.6-sol', maxWait: '15m'));
     $t->assertTrue($bw->shouldBatch('gpt-5.6-sol', maxWait: '15m', default: true));
 });
 
-$h->test('should_batch holder timeouten naar serveren haenger', function (Harness $t): void {
-    // Denne ER synkron - kalderen venter paa svaret - saa timeouten er det
-    // eneste der beskytter ham.
-    reneOmgivelser();
-    $sorthul = new SortHul();
+$h->test('should_batch holds the timeout when the server hangs', function (Harness $t): void {
+    // This one IS synchronous - the caller waits for the answer - so the timeout
+    // is the only thing protecting him.
+    cleanEnv();
+    $blackhole = new BlackHole();
     try {
-        $bw = new Client(baseUrl: $sorthul->url, timeout: 0.5);
+        $bw = new Client(baseUrl: $blackhole->url, timeout: 0.5);
         $t0 = microtime(true);
         $t->assertFalse($bw->shouldBatch('gpt-5.6-sol', maxWait: '15m'));
-        $brugt = microtime(true) - $t0;
-        $t->assertLessThan(3.0, $brugt, sprintf('should_batch ventede %.2f s paa en doed server', $brugt));
+        $elapsed = microtime(true) - $t0;
+        $t->assertLessThan(3.0, $elapsed, sprintf('should_batch waited %.2f s on a dead server', $elapsed));
     } finally {
-        $sorthul->luk();
+        $blackhole->close();
     }
 });
 
-$h->test('advice og wait_now returnerer null', function (Harness $t): void {
-    reneOmgivelser();
-    $bw = new Client(baseUrl: lukketPort(), timeout: 0.5);
+$h->test('advice and wait_now return null', function (Harness $t): void {
+    cleanEnv();
+    $bw = new Client(baseUrl: closedPort(), timeout: 0.5);
     $t->assertNull($bw->advice('gpt-5.6-sol'));
     $t->assertNull($bw->waitNow('gpt-5.6-sol'));
 });
 
-$h->test('serverfejl er ogsaa fejl der sluges', function (Harness $t): void {
-    // 500 fra en server der ER der. En anden gren end "ingen forbindelse".
-    reneOmgivelser();
-    $server = new FalskServer(['/v1' => ['error' => 'boom']], ['/v1' => 500]);
+$h->test('server errors are also errors that get swallowed', function (Harness $t): void {
+    // 500 from a server that IS there. A different branch than "no connection".
+    cleanEnv();
+    $server = new FakeServer(['/v1' => ['error' => 'boom']], ['/v1' => 500]);
     try {
         $bw = new Client(baseUrl: $server->url, timeout: 1.0);
         $t->assertFalse($bw->shouldBatch('gpt-5.6-sol'));
-        $bw->track('gpt-5.6-sol', inputTokens: 10, blok: function ($tr): void {
+        $bw->track('gpt-5.6-sol', inputTokens: 10, block: function ($tr): void {
             $tr->done(outputTokens: 5);
         });
         $t->assertTrue($bw->flush(timeout: 5.0));
     } finally {
-        $server->luk();
+        $server->close();
     }
 });
 
-$h->test('enabled=false sender intet', function (Harness $t): void {
-    reneOmgivelser();
-    $server = new FalskServer();
+$h->test('enabled=false sends nothing', function (Harness $t): void {
+    cleanEnv();
+    $server = new FakeServer();
     try {
         $bw = new Client(baseUrl: $server->url, enabled: false);
-        $bw->track('gpt-5.6-sol', inputTokens: 10, blok: function ($tr): void {
+        $bw->track('gpt-5.6-sol', inputTokens: 10, block: function ($tr): void {
             $tr->done(outputTokens: 5);
         });
         $bw->flush(timeout: 2.0);
-        // Giv en evt. afsendelse tid til at lande (der skal ingen komme).
+        // Give any submission time to land (none should come).
         usleep(100_000);
-        $t->assertCount(0, $server->kald(), 'enabled=false sendte alligevel noget');
+        $t->assertCount(0, $server->calls(), 'enabled=false sent something anyway');
     } finally {
-        $server->luk();
+        $server->close();
     }
 });
 
-$h->test('positiv kontrol - serveren bliver ellers kaldt', function (Harness $t): void {
-    // Uden den her beviser testene ovenfor ingenting: en klient der aldrig
-    // sender noget ville ogsaa bestaa dem alle sammen.
-    reneOmgivelser();
-    $server = new FalskServer();
+$h->test('positive control - the server does otherwise get called', function (Harness $t): void {
+    // Without this one the tests above prove nothing: a client that never sends
+    // anything would also pass all of them.
+    cleanEnv();
+    $server = new FakeServer();
     try {
         $bw = new Client(baseUrl: $server->url, timeout: 2.0);
-        $bw->track('gpt-5.6-sol', inputTokens: 10, blok: function ($tr): void {
+        $bw->track('gpt-5.6-sol', inputTokens: 10, block: function ($tr): void {
             $tr->done(outputTokens: 5);
         });
         $t->assertTrue($bw->flush(timeout: 5.0));
-        $t->assertNotEmpty($server->kaldTil('/v1/calls', 'POST'), 'ingen POST /v1/calls');
+        $t->assertNotEmpty($server->callsTo('/v1/calls', 'POST'), 'no POST /v1/calls');
     } finally {
-        $server->luk();
+        $server->close();
     }
 });
 

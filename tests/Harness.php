@@ -2,203 +2,203 @@
 
 declare(strict_types=1);
 
-// En lillebitte testrunner. Ingen PHPUnit, ingen Composer - klienten skal
-// kunne proeves paa den noegne standardinstallation, praecis som den koerer.
+// A tiny test runner. No PHPUnit, no Composer - the client must be testable on
+// the bare standard installation, exactly as it runs.
 //
-// Brug:
-//   $h = new Harness('SuiteNavn');
-//   $h->test('beskrivelse', function (Harness $t) { $t->assertTrue(...); });
-//   exit($h->run());   // 0 = alt groent
+// Use:
+//   $h = new Harness('SuiteName');
+//   $h->test('description', function (Harness $t) { $t->assertTrue(...); });
+//   exit($h->run());   // 0 = all green
 
 final class Harness
 {
-    private string $navn;
-    /** @var list<array{navn:string, fn:callable}> */
+    private string $name;
+    /** @var list<array{name:string, fn:callable}> */
     private array $tests = [];
-    private int $bestaaet = 0;
-    private int $fejlet = 0;
+    private int $passed = 0;
+    private int $failed = 0;
     private int $asserts = 0;
     /** @var list<string> */
-    private array $fejl = [];
+    private array $errors = [];
 
-    public function __construct(string $navn)
+    public function __construct(string $name)
     {
-        $this->navn = $navn;
+        $this->name = $name;
     }
 
-    public function test(string $navn, callable $fn): void
+    public function test(string $name, callable $fn): void
     {
-        $this->tests[] = ['navn' => $navn, 'fn' => $fn];
+        $this->tests[] = ['name' => $name, 'fn' => $fn];
     }
 
     public function run(): int
     {
-        fwrite(STDOUT, "\n== {$this->navn} ==\n");
+        fwrite(STDOUT, "\n== {$this->name} ==\n");
         foreach ($this->tests as $t) {
             try {
                 ($t['fn'])($this);
-                $this->bestaaet++;
-                fwrite(STDOUT, "  ok    {$t['navn']}\n");
+                $this->passed++;
+                fwrite(STDOUT, "  ok    {$t['name']}\n");
             } catch (\Throwable $e) {
-                $this->fejlet++;
-                $sted = $e->getFile() . ':' . $e->getLine();
-                $this->fejl[] = "{$this->navn} > {$t['navn']}: {$e->getMessage()} ({$sted})";
-                fwrite(STDOUT, "  FAIL  {$t['navn']}: {$e->getMessage()}\n");
+                $this->failed++;
+                $location = $e->getFile() . ':' . $e->getLine();
+                $this->errors[] = "{$this->name} > {$t['name']}: {$e->getMessage()} ({$location})";
+                fwrite(STDOUT, "  FAIL  {$t['name']}: {$e->getMessage()}\n");
             }
         }
         fwrite(STDOUT, sprintf(
-            "-- %s: %d bestaaet, %d fejlet, %d asserts --\n",
-            $this->navn,
-            $this->bestaaet,
-            $this->fejlet,
+            "-- %s: %d passed, %d failed, %d asserts --\n",
+            $this->name,
+            $this->passed,
+            $this->failed,
             $this->asserts,
         ));
-        return $this->fejlet === 0 ? 0 : 1;
+        return $this->failed === 0 ? 0 : 1;
     }
 
-    public function bestaaetAntal(): int
+    public function passedCount(): int
     {
-        return $this->bestaaet;
+        return $this->passed;
     }
 
-    public function fejletAntal(): int
+    public function failedCount(): int
     {
-        return $this->fejlet;
+        return $this->failed;
     }
 
     /** @return list<string> */
-    public function fejlListe(): array
+    public function errorList(): array
     {
-        return $this->fejl;
+        return $this->errors;
     }
 
     // ----------------------------------------------------------- assertions
 
-    public function assertTrue(bool $vilkaar, string $besked = ''): void
+    public function assertTrue(bool $condition, string $message = ''): void
     {
         $this->asserts++;
-        if ($vilkaar !== true) {
-            throw new \AssertionError($besked !== '' ? $besked : 'forventede true');
+        if ($condition !== true) {
+            throw new \AssertionError($message !== '' ? $message : 'expected true');
         }
     }
 
-    public function assertFalse(bool $vilkaar, string $besked = ''): void
+    public function assertFalse(bool $condition, string $message = ''): void
     {
         $this->asserts++;
-        if ($vilkaar !== false) {
-            throw new \AssertionError($besked !== '' ? $besked : 'forventede false');
-        }
-    }
-
-    /**
-     * @param mixed $forventet
-     * @param mixed $faktisk
-     */
-    public function assertEquals($forventet, $faktisk, string $besked = ''): void
-    {
-        $this->asserts++;
-        if ($forventet !== $faktisk) {
-            $f = var_export($forventet, true);
-            $a = var_export($faktisk, true);
-            throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . "forventede {$f}, fik {$a}");
+        if ($condition !== false) {
+            throw new \AssertionError($message !== '' ? $message : 'expected false');
         }
     }
 
     /**
-     * @param mixed $vaerdi
+     * @param mixed $expected
+     * @param mixed $actual
      */
-    public function assertNull($vaerdi, string $besked = ''): void
+    public function assertEquals($expected, $actual, string $message = ''): void
     {
         $this->asserts++;
-        if ($vaerdi !== null) {
-            throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . 'forventede null, fik ' . var_export($vaerdi, true));
+        if ($expected !== $actual) {
+            $e = var_export($expected, true);
+            $a = var_export($actual, true);
+            throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . "expected {$e}, got {$a}");
         }
     }
 
     /**
-     * @param mixed $vaerdi
+     * @param mixed $value
      */
-    public function assertNotNull($vaerdi, string $besked = ''): void
+    public function assertNull($value, string $message = ''): void
     {
         $this->asserts++;
-        if ($vaerdi === null) {
-            throw new \AssertionError($besked !== '' ? $besked : 'forventede ikke-null');
-        }
-    }
-
-    public function assertContains(string $noegleord, string $haystack, string $besked = ''): void
-    {
-        $this->asserts++;
-        if (!str_contains($haystack, $noegleord)) {
-            throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . "forventede at finde '{$noegleord}'");
-        }
-    }
-
-    public function assertNotContains(string $noegleord, string $haystack, string $besked = ''): void
-    {
-        $this->asserts++;
-        if (str_contains($haystack, $noegleord)) {
-            throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . "forventede IKKE at finde '{$noegleord}'");
+        if ($value !== null) {
+            throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . 'expected null, got ' . var_export($value, true));
         }
     }
 
     /**
-     * @param mixed $behold
-     * @param list<mixed> $liste
+     * @param mixed $value
      */
-    public function assertInList($behold, array $liste, string $besked = ''): void
+    public function assertNotNull($value, string $message = ''): void
     {
         $this->asserts++;
-        if (!in_array($behold, $liste, true)) {
-            throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . 'ikke paa listen: ' . var_export($behold, true));
+        if ($value === null) {
+            throw new \AssertionError($message !== '' ? $message : 'expected non-null');
+        }
+    }
+
+    public function assertContains(string $needle, string $haystack, string $message = ''): void
+    {
+        $this->asserts++;
+        if (!str_contains($haystack, $needle)) {
+            throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . "expected to find '{$needle}'");
+        }
+    }
+
+    public function assertNotContains(string $needle, string $haystack, string $message = ''): void
+    {
+        $this->asserts++;
+        if (str_contains($haystack, $needle)) {
+            throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . "expected NOT to find '{$needle}'");
         }
     }
 
     /**
-     * @param array<mixed>|\Countable $liste
+     * @param mixed $value
+     * @param list<mixed> $list
      */
-    public function assertNotEmpty($liste, string $besked = ''): void
+    public function assertInList($value, array $list, string $message = ''): void
     {
         $this->asserts++;
-        if (count($liste) === 0) {
-            throw new \AssertionError($besked !== '' ? $besked : 'forventede ikke-tom');
+        if (!in_array($value, $list, true)) {
+            throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . 'not in the list: ' . var_export($value, true));
         }
     }
 
     /**
-     * @param array<mixed>|\Countable $liste
+     * @param array<mixed>|\Countable $list
      */
-    public function assertCount(int $forventet, $liste, string $besked = ''): void
+    public function assertNotEmpty($list, string $message = ''): void
     {
         $this->asserts++;
-        $n = count($liste);
-        if ($n !== $forventet) {
-            throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . "forventede {$forventet}, fik {$n}");
-        }
-    }
-
-    public function assertLessThan(float $graense, float $faktisk, string $besked = ''): void
-    {
-        $this->asserts++;
-        if (!($faktisk < $graense)) {
-            throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . "forventede < {$graense}, fik {$faktisk}");
+        if (count($list) === 0) {
+            throw new \AssertionError($message !== '' ? $message : 'expected non-empty');
         }
     }
 
     /**
-     * Kald og forvent en bestemt exception-klasse.
+     * @param array<mixed>|\Countable $list
      */
-    public function assertThrows(string $klasse, callable $fn, string $besked = ''): void
+    public function assertCount(int $expected, $list, string $message = ''): void
+    {
+        $this->asserts++;
+        $n = count($list);
+        if ($n !== $expected) {
+            throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . "expected {$expected}, got {$n}");
+        }
+    }
+
+    public function assertLessThan(float $limit, float $actual, string $message = ''): void
+    {
+        $this->asserts++;
+        if (!($actual < $limit)) {
+            throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . "expected < {$limit}, got {$actual}");
+        }
+    }
+
+    /**
+     * Call and expect a specific exception class.
+     */
+    public function assertThrows(string $class, callable $fn, string $message = ''): void
     {
         $this->asserts++;
         try {
             $fn();
         } catch (\Throwable $e) {
-            if ($e instanceof $klasse) {
+            if ($e instanceof $class) {
                 return;
             }
-            throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . "forventede {$klasse}, fik " . get_class($e));
+            throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . "expected {$class}, got " . get_class($e));
         }
-        throw new \AssertionError(($besked !== '' ? $besked . ' - ' : '') . "forventede {$klasse}, intet kastet");
+        throw new \AssertionError(($message !== '' ? $message . ' - ' : '') . "expected {$class}, nothing thrown");
     }
 }

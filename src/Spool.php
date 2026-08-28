@@ -2,50 +2,50 @@
 
 declare(strict_types=1);
 
-// On-disk spool for maalinger der ikke kunne afleveres.
+// On-disk spool for measurements that could not be delivered.
 //
-// En maaling er mest vaerd praecis naar netvaerket driller, saa det er det
-// vaerst taenkelige oejeblik at tabe en. Uafleverbare *faerdige* maalinger
-// bliver derfor lagt i en JSONL-fil og spillet af senere gennem
+// A measurement is worth the most exactly when the network is playing up, so
+// that is the worst conceivable moment to lose one. Undeliverable *completed*
+// measurements are therefore written to a JSONL file and replayed later through
 // POST /v1/calls/complete.
 //
-// Filformatet er eet JSON-objekt pr. linje, i praecis den form
-// /v1/calls/complete tager imod. Det er det samme format i Python-, Ruby-,
-// Go-, TypeScript- og .NET-klienterne, saa en spoolfil skrevet af den ene kan
-// toemmes af den anden.
+// The file format is one JSON object per line, in exactly the shape
+// /v1/calls/complete accepts. It is the same format in the Python, Ruby, Go,
+// TypeScript and .NET clients, so a spool file written by one can be flushed by
+// another.
 //
-// Genafspilning kraever en API-noegle: /v1/calls/complete tager kalderens
-// egne tidsstempler og er lukket for anonyme kaldere af den grund. En klient
-// uden token spooler derfor slet ikke - en fil ingen kan sende er bare en
-// disklaek.
+// Replay requires an API key: /v1/calls/complete takes the caller's own
+// timestamps and is closed to anonymous callers for that reason. A client
+// without a token therefore does not spool at all - a file no one can send is
+// just a disk leak.
 //
-// Samtidige SKRIVERE i samme proces beskyttes med en fillaas (flock). PHP CLI
-// har ingen rigtige baggrundstraade, saa i praksis skriver een proces ad
-// gangen; men flere PHP-processer der deler samme spoolfil er ikke fuldt
-// koordineret. To processer der toemmer den samme fil samtidig kan sende den
-// samme maaling to gange. Giv hver proces sin egen BATCHWATCH_SPOOL hvis det
-// betyder noget.
+// Concurrent WRITERS in the same process are protected with a file lock
+// (flock). PHP CLI has no real background threads, so in practice one process
+// writes at a time; but several PHP processes sharing the same spool file are
+// not fully coordinated. Two processes flushing the same file at once can send
+// the same measurement twice. Give each process its own BATCHWATCH_SPOOL if
+// that matters.
 
 namespace Batchwatch;
 
-// Konstanterne MAX_BATCH/MAX_BYTES bor i functions.php, saa Client og Spool
-// deler een kopi. require_once er idempotent - functions.php redeklarerer
-// intet hvis composer allerede har loadet den.
+// The constants MAX_BATCH/MAX_BYTES live in functions.php, so Client and Spool
+// share one copy. require_once is idempotent - functions.php redeclares nothing
+// if composer already loaded it.
 require_once __DIR__ . '/functions.php';
 
 /**
- * Append-only JSONL-fil af faerdige maalinger der venter paa at blive sendt.
+ * Append-only JSONL file of completed measurements waiting to be sent.
  */
 final class Spool
 {
     private string $path;
     private string $pending;
     private int $maxBytes;
-    /** @var callable|null Valgfri debug-logger: fn(string $besked): void */
+    /** @var callable|null Optional debug logger: fn(string $message): void */
     private $logger;
 
     /**
-     * @param callable|null $logger fn(string $besked): void
+     * @param callable|null $logger fn(string $message): void
      */
     public function __construct(string $path, int $maxBytes = MAX_BYTES, ?callable $logger = null)
     {
@@ -55,48 +55,48 @@ final class Spool
         $this->logger = $logger;
     }
 
-    // ------------------------------------------------------------------ skriv
+    // ------------------------------------------------------------------ write
 
     /**
-     * Gem een faerdig maaling. Returnerer true hvis den blev gemt.
+     * Store one completed measurement. Returns true if it was stored.
      *
-     * Kaster aldrig: at fejle en spool maa ikke vaere vaerre end den
-     * netvaerksfejl der udloeste spoolen.
+     * Never throws: failing a spool must not be worse than the network error
+     * that triggered the spool.
      *
      * @param array<string,mixed> $record
      */
     public function append(array $record): bool
     {
         try {
-            return $this->skrivEn($record);
+            return $this->writeOne($record);
         } catch (\Throwable $e) {
-            $this->debug('batchwatch: kunne ikke spoole: ' . $e->getMessage());
+            $this->debug('batchwatch: could not spool: ' . $e->getMessage());
             return false;
         }
     }
 
-    // ------------------------------------------------------------------- laes
+    // ------------------------------------------------------------------- read
 
     /**
-     * Flyt alt spoolet ind i pending-filen og returner det.
+     * Move everything spooled into the pending file and return it.
      *
-     * Returnerer en liste af poster. En tom liste betyder at der ikke er
-     * noget at sende - ogsaa naar spoolen slet ikke kunne laeses.
+     * Returns a list of records. An empty list means there is nothing to send -
+     * also when the spool could not be read at all.
      *
      * @return list<array<string,mixed>>
      */
     public function take(): array
     {
         try {
-            return $this->tag();
+            return $this->takeInternal();
         } catch (\Throwable $e) {
-            $this->debug('batchwatch: kunne ikke laese spool: ' . $e->getMessage());
+            $this->debug('batchwatch: could not read spool: ' . $e->getMessage());
             return [];
         }
     }
 
     /**
-     * Laeg poster tilbage efter en delvis eller fejlet toemning.
+     * Put records back after a partial or failed flush.
      *
      * @param list<array<string,mixed>> $remaining
      */
@@ -104,24 +104,24 @@ final class Spool
     {
         try {
             if (!empty($remaining)) {
-                $this->skriv($this->pending, $remaining);
+                $this->writeFile($this->pending, $remaining);
             } elseif (is_file($this->pending)) {
                 @unlink($this->pending);
             }
         } catch (\Throwable $e) {
-            $this->debug('batchwatch: kunne ikke skrive spool tilbage: ' . $e->getMessage());
+            $this->debug('batchwatch: could not write spool back: ' . $e->getMessage());
         }
     }
 
     /**
-     * Antal poster der venter paa disken. Bedste forsoeg, kaster aldrig.
+     * Number of records waiting on disk. Best effort, never throws.
      */
     public function size(): int
     {
         try {
-            return count($this->laes($this->pending)) + count($this->laes($this->path));
+            return count($this->readFile($this->pending)) + count($this->readFile($this->path));
         } catch (\Throwable $e) {
-            $this->debug('batchwatch: kunne ikke taelle spool: ' . $e->getMessage());
+            $this->debug('batchwatch: could not count spool: ' . $e->getMessage());
             return 0;
         }
     }
@@ -136,132 +136,132 @@ final class Spool
         return $this->pending;
     }
 
-    // ----------------------------------------------------------------- privat
+    // --------------------------------------------------------------- private
 
     /**
      * @param array<string,mixed> $record
      */
-    private function skrivEn(array $record): bool
+    private function writeOne(array $record): bool
     {
         if (is_file($this->path) && filesize($this->path) >= $this->maxBytes) {
-            $this->debug("batchwatch: spool er fuld ({$this->path}) - maalingen tabes");
+            $this->debug("batchwatch: spool is full ({$this->path}) - the measurement is dropped");
             return false;
         }
-        $mappe = dirname($this->path);
-        if ($mappe !== '' && $mappe !== '.' && !is_dir($mappe)) {
-            @mkdir($mappe, 0o755, true);
+        $dir = dirname($this->path);
+        if ($dir !== '' && $dir !== '.' && !is_dir($dir)) {
+            @mkdir($dir, 0o755, true);
         }
 
-        $linje = self::json($record);
+        $line = self::json($record);
 
-        // "c+b" og ikke "a+b": vi skal kunne LAESE den sidste byte, og en ren
-        // append er skrivebeskyttet. Slutter filen midt i en linje efter et
-        // nedbrud, skal den naeste maaling ikke limes fast paa den - saa taber
-        // vi ikke bare den halve linje, men ogsaa den hele.
+        // "c+b" and not "a+b": we must be able to READ the last byte, and a pure
+        // append is read-locked. If the file ends mid-line after a crash, the
+        // next measurement must not be glued onto it - otherwise we lose not
+        // just the half line, but the whole one too.
         //
-        // flock() beskytter mod at to skrivere i samme (eller en anden) proces
-        // splitter deres skrivninger ind i hinanden. PHP CLI kan ikke traade
-        // egentligt, men shutdown-hooks og genindlejrede kald kan alligevel
-        // krydse hinanden, saa laasen bliver staaende.
+        // flock() guards against two writers in the same (or another) process
+        // splitting their writes into each other. PHP CLI cannot really thread,
+        // but shutdown hooks and re-entrant calls can still cross each other, so
+        // the lock stays.
         $f = @fopen($this->path, 'c+b');
         if ($f === false) {
-            $this->debug("batchwatch: kunne ikke aabne spoolfilen ({$this->path})");
+            $this->debug("batchwatch: could not open the spool file ({$this->path})");
             return false;
         }
         try {
             @flock($f, LOCK_EX);
             fseek($f, 0, SEEK_END);
-            $stoerrelse = ftell($f);
-            $foran = '';
-            if ($stoerrelse > 0) {
-                fseek($f, $stoerrelse - 1);
-                $sidste = fread($f, 1);
-                if ($sidste !== "\n") {
-                    $foran = "\n";
+            $size = ftell($f);
+            $prefix = '';
+            if ($size > 0) {
+                fseek($f, $size - 1);
+                $last = fread($f, 1);
+                if ($last !== "\n") {
+                    $prefix = "\n";
                 }
                 fseek($f, 0, SEEK_END);
             }
-            // EEN skrivning. Deles den op, kan en anden skriver naa at skyde
-            // sin linje ind imellem de to halvdele.
-            fwrite($f, $foran . $linje . "\n");
+            // ONE write. If split up, another writer can slip its line in
+            // between the two halves.
+            fwrite($f, $prefix . $line . "\n");
             @flock($f, LOCK_UN);
         } finally {
             fclose($f);
         }
-        $this->debug("batchwatch: maaling spoolet til {$this->path}");
+        $this->debug("batchwatch: measurement spooled to {$this->path}");
         return true;
     }
 
     /**
      * @return list<array<string,mixed>>
      */
-    private function tag(): array
+    private function takeInternal(): array
     {
-        $poster = array_merge($this->laes($this->pending), $this->laes($this->path));
-        if (empty($poster)) {
+        $records = array_merge($this->readFile($this->pending), $this->readFile($this->path));
+        if (empty($records)) {
             return [];
         }
-        // Raekkefoelgen er med vilje: skriv pending FOER kilden fjernes. Et
-        // nedbrud midt imellem skal give dubletter, ikke tab - en dublet kan
-        // ses og filtreres fra, en tabt maaling findes ikke.
-        $this->skriv($this->pending, $poster);
+        // The order is deliberate: write pending BEFORE the source is removed. A
+        // crash in between must produce duplicates, not loss - a duplicate can
+        // be seen and filtered out, a lost measurement does not exist.
+        $this->writeFile($this->pending, $records);
         if (is_file($this->path)) {
             @unlink($this->path);
         }
-        return $poster;
+        return $records;
     }
 
     /**
      * @return list<array<string,mixed>>
      */
-    private function laes(string $sti): array
+    private function readFile(string $path): array
     {
-        if (!is_file($sti)) {
+        if (!is_file($path)) {
             return [];
         }
-        $ud = [];
-        $f = @fopen($sti, 'rb');
+        $out = [];
+        $f = @fopen($path, 'rb');
         if ($f === false) {
             return [];
         }
         try {
-            while (($linje = fgets($f)) !== false) {
-                $linje = trim($linje);
-                if ($linje === '') {
+            while (($line = fgets($f)) !== false) {
+                $line = trim($line);
+                if ($line === '') {
                     continue;
                 }
-                $rec = json_decode($linje, true);
+                $rec = json_decode($line, true);
                 if (json_last_error() !== JSON_ERROR_NONE || !is_array($rec)) {
-                    // En halvskreven linje efter et nedbrud. Spring den over i
-                    // stedet for at tabe resten af filen.
-                    $this->debug('batchwatch: ubrugelig linje i spool sprunget over');
+                    // A half-written line after a crash. Skip it instead of
+                    // losing the rest of the file.
+                    $this->debug('batchwatch: unusable line in spool skipped');
                     continue;
                 }
-                $ud[] = $rec;
+                $out[] = $rec;
             }
         } finally {
             fclose($f);
         }
-        return $ud;
+        return $out;
     }
 
     /**
-     * @param list<array<string,mixed>> $poster
+     * @param list<array<string,mixed>> $records
      */
-    private function skriv(string $sti, array $poster): void
+    private function writeFile(string $path, array $records): void
     {
-        $mappe = dirname($sti);
-        if ($mappe !== '' && $mappe !== '.' && !is_dir($mappe)) {
-            @mkdir($mappe, 0o755, true);
+        $dir = dirname($path);
+        if ($dir !== '' && $dir !== '.' && !is_dir($dir)) {
+            @mkdir($dir, 0o755, true);
         }
         $buffer = '';
-        foreach ($poster as $p) {
+        foreach ($records as $p) {
             $buffer .= self::json($p) . "\n";
         }
-        // Een write under laas, saa en samtidig laeser aldrig ser en halv fil.
-        $f = @fopen($sti, 'wb');
+        // One write under lock, so a concurrent reader never sees a half file.
+        $f = @fopen($path, 'wb');
         if ($f === false) {
-            $this->debug("batchwatch: kunne ikke skrive spool ({$sti})");
+            $this->debug("batchwatch: could not write spool ({$path})");
             return;
         }
         try {
@@ -274,8 +274,8 @@ final class Spool
     }
 
     /**
-     * JSON uden escaping af skraastreger, saa endpoint-stier forbliver
-     * laesbare og formatet matcher de andre klienter byte for byte.
+     * JSON without escaping of slashes, so endpoint paths stay readable and the
+     * format matches the other clients byte for byte.
      *
      * @param array<string,mixed> $record
      */
@@ -284,10 +284,10 @@ final class Spool
         return json_encode($record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
-    private function debug(string $besked): void
+    private function debug(string $message): void
     {
         if ($this->logger !== null) {
-            ($this->logger)($besked);
+            ($this->logger)($message);
         }
     }
 }

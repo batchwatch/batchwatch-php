@@ -7,20 +7,20 @@ namespace Batchwatch;
 require_once __DIR__ . '/functions.php';
 
 /**
- * Haandtag for een maaling i luften. Returneres af Client::track().
+ * Handle for one measurement in flight. Returned by Client::track().
  *
- * Egen fil, saa PSR-4 kan autoloade den. Bemaerk traad-idiomet i Client.php:
- * "i baggrunden" er synkront i PHP, men fejlfrit mod kalderen.
+ * Its own file, so PSR-4 can autoload it. Note the thread idiom in Client.php:
+ * "in the background" is synchronous in PHP, but error-free towards the caller.
  */
 final class Tracking
 {
     private Client $bw;
     /** @var array<string,mixed> */
-    private array $krop;
+    private array $body;
     private ?int $inputTokens;
     private ?string $id = null;
     private float $t0;
-    private bool $afsluttet = false;
+    private bool $finished = false;
 
     public function __construct(
         Client $bw,
@@ -32,7 +32,7 @@ final class Tracking
         ?string $endpoint,
     ) {
         $this->bw = $bw;
-        $this->krop = [
+        $this->body = [
             'provider' => $provider,
             'model' => $model,
             'mode' => $mode,
@@ -48,32 +48,33 @@ final class Tracking
         return $this->id;
     }
 
-    public function afsluttet(): bool
+    public function finished(): bool
     {
-        return $this->afsluttet;
+        return $this->finished;
     }
 
     public function start(): void
     {
-        $krop = $this->krop;
-        $krop['input_tokens'] = $this->inputTokens;
-        $krop['started_at'] = iso($this->t0);
+        $body = $this->body;
+        $body['input_tokens'] = $this->inputTokens;
+        $body['started_at'] = iso($this->t0);
 
-        $this->bw->iBaggrunden(function () use ($krop): void {
-            $r = $this->bw->kald('/v1/calls', 'POST', rens($krop));
+        $this->bw->inBackground(function () use ($body): void {
+            $startBody = sanitize($body);
+            $r = $this->bw->request('/v1/calls', 'POST', $startBody, null, idemStart($startBody));
             $this->id = ($r !== null && isset($r['id'])) ? (string) $r['id'] : null;
             if ($r !== null && !empty($r['warning'])) {
-                // Serverens advarsel er interessant men maa aldrig kaste.
+                // The server's warning is interesting but must never throw.
                 error_log('batchwatch: ' . $r['warning']);
             }
             if ($r !== null) {
-                $this->bw->maaskeToemSpool();
+                $this->bw->maybeFlushSpool();
             }
         });
     }
 
     /**
-     * Opdater tokentallet naar det foerst kendes efter afsendelsen.
+     * Update the token count when it is only known after submission.
      */
     public function started(?int $inputTokens = null): void
     {
@@ -83,66 +84,70 @@ final class Tracking
     }
 
     /**
-     * Luk maalingen.
+     * Close the measurement.
      *
-     * outputTokens forbliver null naar du ikke kender dem. Den defaultes aldrig
-     * til nul: nul er en maaling, fravaer er ikke, og serveren prissaetter dem
-     * forskelligt med vilje.
+     * outputTokens stays null when you do not know it. It never defaults to
+     * zero: zero is a measurement, absence is not, and the server prices them
+     * differently on purpose.
      */
     public function done(?int $outputTokens = null, string $status = 'completed', ?int $ttfbMs = null): void
     {
-        if ($this->afsluttet) {
+        if ($this->finished) {
             return;
         }
-        $this->afsluttet = true;
-        $slut = (float) time();
+        $this->finished = true;
+        $end = (float) time();
 
-        // Udfaldsmaalingen (#101): det seneste raad for DENNE model, haeftet paa
-        // afslutningen. Intet raad -> tom array -> felterne udelades helt.
-        $raad = udfaldsfelter($this->bw->hentRaad((string) $this->krop['model']));
+        // The outcome measurement (#101): the latest advice for THIS model,
+        // attached to the completion. No advice -> empty array -> the fields are
+        // omitted entirely.
+        $advice = outcomeFields($this->bw->getAdvice((string) $this->body['model']));
 
-        $this->bw->iBaggrunden(function () use ($outputTokens, $status, $ttfbMs, $slut, $raad): void {
-            $fuld = $this->krop;
-            $fuld['input_tokens'] = $this->inputTokens;
-            $fuld['output_tokens'] = $outputTokens;
-            $fuld['status'] = $status;
-            $fuld['started_at'] = iso($this->t0);
-            $fuld['ended_at'] = iso($slut);
+        $this->bw->inBackground(function () use ($outputTokens, $status, $ttfbMs, $end, $advice): void {
+            $full = $this->body;
+            $full['input_tokens'] = $this->inputTokens;
+            $full['output_tokens'] = $outputTokens;
+            $full['status'] = $status;
+            $full['started_at'] = iso($this->t0);
+            $full['ended_at'] = iso($end);
             if ($ttfbMs !== null) {
-                $fuld['ttfb_ms'] = $ttfbMs;
+                $full['ttfb_ms'] = $ttfbMs;
             }
-            $fuld = array_merge($fuld, $raad);
+            $full = array_merge($full, $advice);
 
             if ($this->id !== null) {
                 try {
-                    $this->bw->kald('/v1/calls/' . $this->id, 'PATCH', rens(array_merge([
+                    $this->bw->request('/v1/calls/' . $this->id, 'PATCH', sanitize(array_merge([
                         'status' => $status,
                         'output_tokens' => $outputTokens,
                         'ttfb_ms' => $ttfbMs,
-                        'ended_at' => iso($slut),
-                    ], $raad)));
+                        'ended_at' => iso($end),
+                    ], $advice)));
                     return;
                 } catch (\Throwable $e) {
-                    // Serveren har allerede starten. En spoolet genindsendelse
-                    // kan derfor give en dublet hvis PATCH'en naaede frem
-                    // alligevel - valgt med vilje: en dublet kan ses i
-                    // datasaettet, en tabt maaling kan ikke.
-                    $this->bw->spoolMaaling(rens($fuld));
+                    // The server already has the start. A spooled resubmission
+                    // can therefore produce a duplicate if the PATCH did arrive
+                    // after all - chosen deliberately: a duplicate is visible in
+                    // the dataset, a lost measurement is not.
+                    $this->bw->spoolMeasurement(sanitize($full));
                     return;
                 }
             }
-            // Start-kaldet naaede aldrig frem. Send hele maalingen paa een gang
-            // i stedet for at tabe den.
+            // The start call never arrived. Send the whole measurement in one go
+            // instead of losing it. The key is derived from the measurement, so
+            // a later spool replay of exactly this record carries the SAME key
+            // and is deduplicated (#30).
+            $sanitized = sanitize($full);
             try {
-                $this->bw->kald('/v1/calls/complete', 'POST', rens($fuld));
+                $this->bw->request('/v1/calls/complete', 'POST', $sanitized, null, idemComplete([$sanitized]));
             } catch (\Throwable $e) {
-                $this->bw->spoolMaaling(rens($fuld));
+                $this->bw->spoolMeasurement($sanitized);
             }
         });
     }
 
     /**
-     * Optag jobbet som ikke-faerdigt. En uafsluttet ventetid er ikke en ventetid.
+     * Record the job as not completed. An unfinished wait is not a wait.
      */
     public function failed(string $status = 'failed'): void
     {

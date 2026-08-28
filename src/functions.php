@@ -2,48 +2,50 @@
 
 declare(strict_types=1);
 
-// Namespace-niveau konstanter og fri-funktioner for batchwatch-klienten.
+// Namespace-level constants and free functions for the batchwatch client.
 //
-// De ligger i deres egen fil af to grunde: PSR-4 autoloader kun KLASSER, saa
-// fri-funktioner og konstanter skal loades eksplicit (composer "files", eller
-// bootstrap.php uden composer); og baade Client og Spool deler nogle af dem
-// (MAX_BATCH/MAX_BYTES), saa een fil undgaar en cirkulaer afhaengighed.
+// They live in their own file for two reasons: PSR-4 only autoloads CLASSES, so
+// free functions and constants must be loaded explicitly (composer "files", or
+// bootstrap.php without composer); and both Client and Spool share some of them
+// (MAX_BATCH/MAX_BYTES), so keeping them in one file avoids a circular
+// dependency.
 //
-// Filen er idempotent: den kan require_once'es fra baade Client.php og
-// Spool.php uden at redeklarere noget.
+// The file is idempotent: it can be require_once'd from both Client.php and
+// Spool.php without redeclaring anything.
 
 namespace Batchwatch;
 
-// Idempotent guard: er filen allerede loadet (af composer "files", af
-// bootstrap.php, eller af et require_once i Client/Spool), saa er alt
-// deklareret, og vi vender om med det samme. const/function kan ikke staa i en
-// if-blok paa compile-tid, saa et tidligt file-return er den rene loesning.
+// Idempotent guard: if the file is already loaded (by composer "files", by
+// bootstrap.php, or by a require_once in Client/Spool) then everything is
+// declared and we return immediately. const/function cannot sit inside an
+// if-block at compile time, so an early file-return is the clean solution.
 if (\defined('Batchwatch\\VERSION')) {
     return;
 }
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
-// Hvor ofte vi hoejst proever at toemme spoolen af os selv.
+// How often, at most, we try to flush the spool on our own.
 const SPOOL_INTERVAL_S = 60.0;
 
-// Serverens loft paa een POST /v1/calls/complete.
+// The server's cap on one POST /v1/calls/complete.
 const MAX_BATCH = 500;
 
-// Loft paa spoolfilen. Er batchwatch nede i en uge, skal en travl pipeline
-// ikke fylde brugerens disk op. Naar loftet er naaet, tabes maalingen - og
-// det er det rigtige valg: hans maskine er ikke vores lager.
+// Cap on the spool file. If batchwatch is down for a week, a busy pipeline must
+// not fill up the user's disk. Once the cap is reached the measurement is
+// dropped - and that is the right call: his machine is not our storage.
 const MAX_BYTES = 5 * 1024 * 1024;
 
-// Feltnavne der maa forlade maskinen. Alt andet findes ikke i kroppen.
-// Testen test_no_content.php holder listen fast. Samme felter som
-// Python-, Ruby-, Go-, TypeScript- og .NET-klienterne.
+// Field names that may leave the machine. Everything else is absent from the
+// body. The test test_no_content.php holds this list fixed. Same fields as the
+// Python, Ruby, Go, TypeScript and .NET clients.
 //
-// De fire sidste (acted_verdict, deadline_s, quoted_p50_s, quoted_p90_s) er
-// udfaldsmaalingen (#101): raadet vi selv gav, haeftet paa den senere
-// afslutning saa SERVEREN kan sammenholde sin egen maalte varighed med hvad vi
-// lovede. Alt er tal og en beslutning vi selv traf - ingen ny PII.
-const TILLADTE_FELTER = [
+// The last four (acted_verdict, deadline_s, quoted_p50_s, quoted_p90_s) are the
+// outcome measurement (#101): the advice we gave ourselves, attached to the
+// later completion so the SERVER can compare its own measured duration against
+// what we promised. Everything is numbers and a decision we made ourselves - no
+// new PII.
+const ALLOWED_FIELDS = [
     'provider', 'model', 'mode', 'endpoint', 'requests',
     'input_tokens', 'output_tokens', 'started_at', 'ended_at',
     'status', 'ttfb_ms', 'source',
@@ -51,34 +53,34 @@ const TILLADTE_FELTER = [
 ];
 
 /**
- * Fjern alt der ikke staar paa tilladelseslisten.
+ * Drop everything not on the allowlist.
  *
- * Sidste stop foer netvaerket. Selv om ingen offentlig metode tager imod
- * fritekst, skal DENNE funktion vaere det sted man kan pege paa naar nogen
- * spoerger "hvordan ved I at en prompt ikke kan slippe ud".
+ * The last stop before the network. Even though no public method accepts free
+ * text, THIS function must be the place you can point at when someone asks "how
+ * do you know a prompt cannot slip out".
  *
- * @param array<string,mixed> $krop
+ * @param array<string,mixed> $body
  * @return array<string,mixed>
  */
-function rens(array $krop): array
+function sanitize(array $body): array
 {
-    $ud = [];
-    foreach ($krop as $k => $v) {
-        if (\in_array((string) $k, TILLADTE_FELTER, true)) {
-            $ud[(string) $k] = $v;
+    $out = [];
+    foreach ($body as $k => $v) {
+        if (\in_array((string) $k, ALLOWED_FIELDS, true)) {
+            $out[(string) $k] = $v;
         }
     }
-    return $ud;
+    return $out;
 }
 
 /**
- * Oversaet et max_wait til sekunder, eller null hvis vi ikke kan tyde det.
+ * Translate a max_wait into seconds, or null if we cannot parse it.
  *
- * Kalderen skriver typisk "15m", "1h", "30s" eller "2d" - samme sprog som
- * /v1/should-i-batch selv tager imod. Et blankt tal laeses som sekunder. Kan
- * vi ikke tyde det, sender vi hellere null end et gaet (regel #30).
+ * The caller typically writes "15m", "1h", "30s" or "2d" - the same language
+ * /v1/should-i-batch itself accepts. A bare number is read as seconds. If we
+ * cannot parse it, we send null rather than a guess (rule #30).
  */
-function sekunder(?string $maxWait): ?float
+function seconds(?string $maxWait): ?float
 {
     if ($maxWait === null) {
         return null;
@@ -87,76 +89,132 @@ function sekunder(?string $maxWait): ?float
     if ($s === '') {
         return null;
     }
-    $faktor = ['s' => 1.0, 'm' => 60.0, 'h' => 3600.0, 'd' => 86400.0];
-    $enhed = $s[\strlen($s) - 1];
-    if (isset($faktor[$enhed])) {
-        $tal = \substr($s, 0, -1);
-        $mult = $faktor[$enhed];
+    $factor = ['s' => 1.0, 'm' => 60.0, 'h' => 3600.0, 'd' => 86400.0];
+    $unit = $s[\strlen($s) - 1];
+    if (isset($factor[$unit])) {
+        $number = \substr($s, 0, -1);
+        $mult = $factor[$unit];
     } else {
-        $tal = $s;
+        $number = $s;
         $mult = 1.0;
     }
-    $tal = \trim($tal);
-    if ($tal === '' || !\is_numeric($tal)) {
+    $number = \trim($number);
+    if ($number === '' || !\is_numeric($number)) {
         return null;
     }
-    return (float) $tal * $mult;
+    return (float) $number * $mult;
 }
 
 /**
- * De felter fra et gemt raad der maa haeftes paa en afslutning (#101).
+ * The fields from a stored advice that may be attached to a completion (#101).
  *
- * Kun ikke-null vaerdier kommer med: mangler en percentil eller en frist,
- * UDELADES feltet helt - vi opfinder ikke et nul (regel #30). Uden raad
- * overhovedet er resultatet en tom array, saa ingenting haeftes paa.
+ * Only non-null values are included: if a percentile or a deadline is missing,
+ * the field is OMITTED entirely - we do not invent a zero (rule #30). With no
+ * advice at all the result is an empty array, so nothing is attached.
  *
- * @param array{acted_verdict:bool,deadline_s:?float,quoted_p50_s:?float,quoted_p90_s:?float}|null $raad
+ * @param array{acted_verdict:bool,deadline_s:?float,quoted_p50_s:?float,quoted_p90_s:?float}|null $advice
  * @return array<string,mixed>
  */
-function udfaldsfelter(?array $raad): array
+function outcomeFields(?array $advice): array
 {
-    if ($raad === null) {
+    if ($advice === null) {
         return [];
     }
-    $ud = ['acted_verdict' => $raad['acted_verdict']];
-    foreach (['deadline_s', 'quoted_p50_s', 'quoted_p90_s'] as $navn) {
-        if (($raad[$navn] ?? null) !== null) {
-            $ud[$navn] = $raad[$navn];
+    $out = ['acted_verdict' => $advice['acted_verdict']];
+    foreach (['deadline_s', 'quoted_p50_s', 'quoted_p90_s'] as $name) {
+        if (($advice[$name] ?? null) !== null) {
+            $out[$name] = $advice[$name];
         }
     }
-    return $ud;
+    return $out;
 }
 
 /**
- * ISO-8601 UTC, sekundoploesning med et efterstillet Z - som de andre
- * klienter.
+ * ISO-8601 UTC, second resolution with a trailing Z - like the other clients.
  */
 function iso(float $ts): string
 {
     return \gmdate('Y-m-d\TH:i:s\Z', (int) $ts);
 }
 
-function standardUrl(): string
+// ---------------------------------------------------------------- idempotency
+//
+// The die-and-reflush problem: the process dies with a completed measurement on
+// disk, starts again and replays it. If the first attempt already arrived, the
+// replay must NOT count the same job twice - a duplicate row drags the
+// percentiles (the whole product) towards the slow tail, because the slow calls
+// are exactly the ones that time out and get sent again.
+//
+// The fix is an Idempotency-Key that the server deduplicates on. The rule that
+// makes it work: the key is DERIVED FROM THE MEASUREMENT, deterministically, so
+// the replay reconstructs exactly the same key as the first attempt. A fresh
+// key at send time (a UUID per call) would give the replay a DIFFERENT key, and
+// nothing would be deduplicated. The key is a pure function of the
+// measurement's content - the record IS its own stored key material.
+//
+// The scheme follows backfill.py's send(): a readable, named string built from
+// the identifying fields; printable ASCII with no control characters.
+
+/**
+ * @param array<string,mixed> $body
+ */
+function idemField(array $body, string $key): string
+{
+    $v = $body[$key] ?? null;
+    return ($v === null) ? '' : (string) $v;
+}
+
+/**
+ * Per-record key for POST /v1/calls (the start call).
+ *
+ * @param array<string,mixed> $body
+ */
+function idemStart(array $body): string
+{
+    return 'bw-start-' . idemField($body, 'provider') . '-' . idemField($body, 'model')
+        . '-' . idemField($body, 'started_at');
+}
+
+/**
+ * Per-request key for POST /v1/calls/complete. Derived from the group being
+ * sent, exactly like backfill.py: a single record is just a group of one. A
+ * replay of the SAME records chunks them identically (the spool preserves
+ * order), so the same request carries the same key.
+ *
+ * @param list<array<string,mixed>> $group
+ */
+function idemComplete(array $group): ?string
+{
+    if (empty($group)) {
+        return null;
+    }
+    $first = $group[0];
+    $last = $group[\count($group) - 1];
+    return 'bw-complete-' . idemField($first, 'provider') . '-' . idemField($first, 'started_at')
+        . '-' . \count($group) . '-' . idemField($last, 'ended_at');
+}
+
+function defaultUrl(): string
 {
     $v = \getenv('BATCHWATCH_URL');
     return ($v === false || $v === '') ? 'https://batchwatch.dev' : $v;
 }
 
-function standardTimeout(): float
+function defaultTimeout(): float
 {
     $v = \getenv('BATCHWATCH_TIMEOUT');
     return ($v === false || $v === '') ? 2.0 : (float) $v;
 }
 
 /**
- * Default spool-sti. Tom streng slaar spoolen fra; ellers en fil i
- * temp-mappen.
+ * Default spool path. An empty string turns the spool off; otherwise a file in
+ * the temp directory.
  */
-function standardSpool(): ?string
+function defaultSpool(): ?string
 {
     $v = \getenv('BATCHWATCH_SPOOL');
     if ($v !== false) {
-        // Tom streng slaar spoolen fra.
+        // An empty string turns the spool off.
         return $v === '' ? null : $v;
     }
     return \rtrim(\sys_get_temp_dir(), '/\\') . \DIRECTORY_SEPARATOR . 'batchwatch-spool.jsonl';

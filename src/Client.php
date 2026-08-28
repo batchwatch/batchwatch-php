@@ -4,100 +4,100 @@ declare(strict_types=1);
 
 // batchwatch client.
 //
-// To regler former denne fil.
+// Two rules shape this file.
 //
-// **Den fejler aldrig opad.** Er batchwatch nede, langsom eller i stykker,
-// maa kalderens batch-job ikke maerke det. Hvert netvaerkskald har en kort
-// timeout (baade opkobling og laesning), og hver fejl bliver slugt og sendt
-// til den valgfri debug-logger. Den eneste undtagelse der nogensinde forlader
-// dette modul er kalderens egen.
+// **It never fails upward.** If batchwatch is down, slow or broken, the
+// caller's batch job must not notice. Every network call has a short timeout
+// (both connect and read), and every error is swallowed and passed to the
+// optional debug logger. The only exception that ever leaves this module is the
+// caller's own.
 //
-// **Den sender aldrig indhold.** Prompts, svar, systemprompter, tool-kald,
-// filnavne - intet af det. Kroppen bygges fra en fast tilladelsesliste af
-// felter: provider, model, mode, endpoint, request-antal, tokental og
-// tidsstempler. Der er intet felt at putte tekst i, per konstruktion.
+// **It never sends content.** Prompts, completions, system prompts, tool calls,
+// file names - none of it. The body is built from a fixed allowlist of fields:
+// provider, model, mode, endpoint, request count, token counts and timestamps.
+// There is no field to put text in, by construction.
 //
-// **En note om traade.** Python- og Ruby-klienterne laegger hvert netvaerks-
-// kald paa en baggrundstraad, saa kalderens traad slet ikke roeres. PHP CLI
-// har ingen aegte baggrundstraade. Vi efterligner derfor SEMANTIKKEN, ikke
-// traaden: afsendelsen sker synkront, men er (a) bundet af en kort timeout paa
-// baade opkobling og laesning, og (b) pakket saa INGEN batchwatch-fejl kan
-// naa kalderen. Kalderen betaler dermed hoejst timeouten (default 2 s) pr.
-// afsendelse i vaerste fald - aldrig en hang, aldrig en exception. Vil man
-// heller ikke betale den tid, saettes en lav BATCHWATCH_TIMEOUT eller
-// enabled=false. flush() findes for API-paritet, men har intet at vente paa.
+// **A note on threads.** The Python and Ruby clients put every network call on
+// a background thread, so the caller's thread is not touched at all. PHP CLI
+// has no real background threads. We therefore mirror the SEMANTICS, not the
+// thread: the submission happens synchronously, but is (a) bounded by a short
+// timeout on both connect and read, and (b) wrapped so NO batchwatch error can
+// reach the caller. The caller thus pays at most the timeout (default 2 s) per
+// submission in the worst case - never a hang, never an exception. If you would
+// rather not pay even that, set a low BATCHWATCH_TIMEOUT or enabled=false.
+// flush() exists for API parity, but has nothing to wait on.
 //
 //     use Batchwatch\Client;
 //
-//     $bw = new Client(token: 'tk_...');            // token er valgfri
+//     $bw = new Client(token: 'tk_...');            // token is optional
 //
-//     // 1) foer du sender: hoerer det her til i koeen?
+//     // 1) before you submit: does this belong in the queue?
 //     if ($bw->shouldBatch('gpt-5.6-sol', maxWait: '15m')) {
 //         // $job = $client->batches->create(...);
 //     } else {
 //         // $answer = $client->chat->completions->create(...);
 //     }
 //
-//     // 2) maal det
+//     // 2) measure it
 //     $t = $bw->track('gpt-5.6-sol', inputTokens: 9720);
 //     // ...
 //     $t->done(outputTokens: 4519);
 
 namespace Batchwatch;
 
-// Konstanter (VERSION, TILLADTE_FELTER, ...) og fri-funktioner (rens, iso,
-// standardUrl, ...) bor i functions.php, saa Client og Spool deler een kopi
-// og PSR-4 (som kun autoloader klasser) ikke efterlader dem udefinerede.
-// require_once er idempotent - composer kan have loadet den allerede.
+// Constants (VERSION, ALLOWED_FIELDS, ...) and free functions (sanitize, iso,
+// defaultUrl, ...) live in functions.php, so Client and Spool share one copy
+// and PSR-4 (which only autoloads classes) does not leave them undefined.
+// require_once is idempotent - composer may have loaded it already.
 require_once __DIR__ . '/functions.php';
-// HttpError og Tracking bor i egne filer (ren PSR-4), men vi loader dem her
-// ogsaa, saa bootstrap.php uden composer stadig virker. require_once er
+// HttpError and Tracking live in their own files (clean PSR-4), but we load
+// them here too, so bootstrap.php without composer still works. require_once is
 // idempotent.
 require_once __DIR__ . '/HttpError.php';
 require_once __DIR__ . '/Tracking.php';
 
 /**
- * Klienten. Hver afsendelse er ikke-blokerende for kalderens LOGIK (ingen
- * exception slipper ud) og bundet af en kort timeout, og fejler aabent.
+ * The client. Every submission is non-blocking for the caller's LOGIC (no
+ * exception escapes) and bounded by a short timeout, and it fails open.
  */
 final class Client
 {
-    // Sentinel til spool-argumentet, saa vi kan skelne "spool ikke oplyst"
-    // (brug default) fra "spool: null" (slaa fra). Ruby har en skjult UNSET;
-    // PHP kan ikke bruge et objekt som default-argument, men en umulig sti
-    // som default-streng goer samme nytte. En rigtig sti er aldrig lig denne.
+    // Sentinel for the spool argument, so we can tell "spool not provided" (use
+    // default) apart from "spool: null" (turn it off). Ruby has a hidden UNSET;
+    // PHP cannot use an object as a default argument, but an impossible path as
+    // a default string does the same job. A real path is never equal to this.
     public const SPOOL_DEFAULT = "\0__BATCHWATCH_SPOOL_DEFAULT__";
 
     private ?string $token;
     private string $base;
     private float $timeout;
     private bool $enabled;
-    /** @var callable|null fn(string $besked): void */
+    /** @var callable|null fn(string $message): void */
     private $logger;
     private ?Spool $spool;
-    private float $spoolSidst = 0.0;
+    private float $spoolLast = 0.0;
     /**
-     * Sidste raad pr. model (#101). Naar shouldBatch svarer, gemmer vi her hvad
-     * vi anbefalede + de citerede percentiler, saa den NAESTE afslutning for
-     * samme model kan haefte dem paa. Korrelationen er en dokumenteret
-     * tilnaermelse: seneste-raad-pr-model, ikke pr-job.
+     * Last advice per model (#101). When shouldBatch answers, we store here what
+     * we recommended + the quoted percentiles, so the NEXT completion for the
+     * same model can attach them. The correlation is a documented approximation:
+     * latest-advice-per-model, not per-job.
      *
      * @var array<string, array{acted_verdict:bool,deadline_s:?float,quoted_p50_s:?float,quoted_p90_s:?float}>
      */
-    private array $raad = [];
+    private array $advice = [];
 
     /**
-     * @param string|null $token   API-noegle. Falder tilbage til $BATCHWATCH_TOKEN.
-     *                             Valgfri til maaling, paakraevet for at genafspille en spool.
-     * @param string|null $baseUrl Default $BATCHWATCH_URL eller https://batchwatch.dev
-     * @param float|null  $timeout Sekunder pr. HTTP-kald. Default $BATCHWATCH_TIMEOUT eller 2.0.
-     * @param bool        $enabled false goer hvert netvaerkskald til en no-op.
-     * @param string|null $spool   Sti til spoolfilen. UDELAD for default
-     *                             ($BATCHWATCH_SPOOL eller en temp-fil); send null for at
-     *                             slaa spooling fra; send en streng for en bestemt sti.
-     *                             Spooling er altid inaktiv uden token.
-     * @param callable|null $logger Valgfri logger fn(string): void. Alle slugte fejl gaar
-     *                             hertil paa debug.
+     * @param string|null $token   API key. Falls back to $BATCHWATCH_TOKEN.
+     *                             Optional for measuring, required to replay a spool.
+     * @param string|null $baseUrl Default $BATCHWATCH_URL or https://batchwatch.dev
+     * @param float|null  $timeout Seconds per HTTP call. Default $BATCHWATCH_TIMEOUT or 2.0.
+     * @param bool        $enabled false makes every network call a no-op.
+     * @param string|null $spool   Path to the spool file. OMIT for the default
+     *                             ($BATCHWATCH_SPOOL or a temp file); pass null to
+     *                             turn spooling off; pass a string for a specific path.
+     *                             Spooling is always inactive without a token.
+     * @param callable|null $logger Optional logger fn(string): void. Every swallowed error goes
+     *                             here at debug level.
      */
     public function __construct(
         ?string $token = null,
@@ -109,22 +109,22 @@ final class Client
     ) {
         $tokenIn = $token ?: (getenv('BATCHWATCH_TOKEN') ?: null);
         $this->token = ($tokenIn === '') ? null : $tokenIn;
-        $this->base = rtrim($baseUrl ?? standardUrl(), '/');
-        $this->timeout = $timeout ?? standardTimeout();
+        $this->base = rtrim($baseUrl ?? defaultUrl(), '/');
+        $this->timeout = $timeout ?? defaultTimeout();
         $this->enabled = $enabled;
         $this->logger = $logger;
 
-        // Sentinel (udeladt) => default-sti; eksplicit null => spooling fra;
-        // ellers den oplyste sti.
-        $sti = ($spool === self::SPOOL_DEFAULT) ? standardSpool() : $spool;
-        // Uden noegle kan /v1/calls/complete ikke tage imod, saa en spoolfil
-        // ville aldrig kunne sendes. Saa lader vi vaere med at skrive den.
-        $this->spool = ($sti !== null && $this->token !== null)
-            ? new Spool($sti, MAX_BYTES, $logger)
+        // Sentinel (omitted) => default path; explicit null => spooling off;
+        // otherwise the provided path.
+        $path = ($spool === self::SPOOL_DEFAULT) ? defaultSpool() : $spool;
+        // Without a key /v1/calls/complete cannot accept, so a spool file could
+        // never be sent. So we simply do not write it.
+        $this->spool = ($path !== null && $this->token !== null)
+            ? new Spool($path, MAX_BYTES, $logger)
             : null;
-        if ($sti !== null && $this->token === null) {
-            $this->debug('batchwatch: ingen token - spool slaaet fra '
-                . '(/v1/calls/complete kraever en noegle)');
+        if ($path !== null && $this->token === null) {
+            $this->debug('batchwatch: no token - spool turned off '
+                . '(/v1/calls/complete requires a key)');
         }
     }
 
@@ -148,43 +148,49 @@ final class Client
         return $this->timeout;
     }
 
-    // ---------------------------------------------------------------- kerne
+    // ----------------------------------------------------------------- core
 
     /**
-     * Eet HTTP-kald. Kaster ved fejl - kun offentlige metoder sluger.
+     * One HTTP call. Throws on error - only public methods swallow.
      *
-     * Bruger PHP-streams (ikke curl - klienten skal koere paa den noegne
-     * standardinstallation). Baade opkoblings- og laese-timeout saettes, saa
-     * en server der accepterer men aldrig svarer ikke kan holde os fanget
-     * laengere end fristen.
+     * Uses PHP streams (not curl - the client must run on the bare standard
+     * installation). Both the connect and the read timeout are set, so a server
+     * that accepts but never answers cannot hold us captive longer than the
+     * deadline.
      *
-     * @param array<string,mixed>|list<mixed>|null $krop
+     * @param array<string,mixed>|list<mixed>|null $body
      * @return array<string,mixed>|null
      */
-    public function kald(string $sti, string $metode = 'GET', array|null $krop = null, ?float $timeout = null): ?array
+    public function request(string $path, string $method = 'GET', array|null $body = null, ?float $timeout = null, ?string $idem = null): ?array
     {
-        $frist = $timeout ?? $this->timeout;
-        $url = $this->base . $sti;
+        $deadline = $timeout ?? $this->timeout;
+        $url = $this->base . $path;
 
         $headers = [
             'user-agent: batchwatch-php/' . VERSION,
         ];
-        $body = null;
-        if ($krop !== null) {
+        $payload = null;
+        if ($body !== null) {
             $headers[] = 'content-type: application/json';
-            $body = json_encode($krop, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $payload = json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         }
         if ($this->token !== null) {
             $headers[] = 'authorization: Bearer ' . $this->token;
         }
+        // Idempotency-Key on the write paths, so the server can deduplicate a
+        // resubmission (#30). The key is derived deterministically from the
+        // measurement.
+        if ($idem !== null && $idem !== '') {
+            $headers[] = 'idempotency-key: ' . $idem;
+        }
 
         $ctx = stream_context_create([
             'http' => [
-                'method' => $metode,
+                'method' => $method,
                 'header' => implode("\r\n", $headers),
-                'content' => $body ?? '',
-                'timeout' => $frist,           // laese-timeout
-                'ignore_errors' => true,        // laes kroppen ogsaa paa 4xx/5xx
+                'content' => $payload ?? '',
+                'timeout' => $deadline,          // read timeout
+                'ignore_errors' => true,         // read the body on 4xx/5xx too
                 'follow_location' => 0,
                 'protocol_version' => 1.1,
             ],
@@ -194,59 +200,61 @@ final class Client
             ],
         ]);
 
-        // Opkoblings-timeout haandteres separat, for stream-context "timeout"
-        // daekker kun laesning/skrivning, ikke selve opkoblingen. Vi aabner
-        // derfor foerst socket'en med samme frist, saa en black-hole-server der
-        // aldrig ACK'er heller ikke kan holde os laengere end fristen.
-        $this->sikrOpkobling($url, $frist);
+        // The connect timeout is handled separately, because the stream-context
+        // "timeout" only covers reading/writing, not the connection itself. We
+        // therefore open the socket first with the same deadline, so a
+        // black-hole server that never ACKs cannot hold us longer than the
+        // deadline either.
+        $this->ensureConnection($url, $deadline);
 
-        $raa = @file_get_contents($url, false, $ctx);
-        if ($raa === false) {
-            $fejl = error_get_last();
-            throw new \RuntimeException('batchwatch netvaerksfejl: ' . ($fejl['message'] ?? 'ukendt'));
+        $raw = @file_get_contents($url, false, $ctx);
+        if ($raw === false) {
+            $error = error_get_last();
+            throw new \RuntimeException('batchwatch network error: ' . ($error['message'] ?? 'unknown'));
         }
 
-        $kode = $this->statusFraHeaders($http_response_header ?? []);
-        if ($kode < 200 || $kode >= 300) {
-            throw new HttpError($kode, $raa);
+        $code = $this->statusFromHeaders($http_response_header ?? []);
+        if ($code < 200 || $code >= 300) {
+            throw new HttpError($code, $raw);
         }
 
-        $raa = trim($raa);
-        if ($raa === '') {
+        $raw = trim($raw);
+        if ($raw === '') {
             return null;
         }
-        $ud = json_decode($raa, true);
-        return is_array($ud) ? $ud : null;
+        $out = json_decode($raw, true);
+        return is_array($out) ? $out : null;
     }
 
     /**
-     * Aaben en TCP/TLS-opkobling med en haard frist, saa en server der aldrig
-     * accepterer/ACK'er ikke kan holde os fanget - stream-context "timeout"
-     * daekker ikke opkoblingen selv. Vi lukker den straks igen; file_get_contents
-     * laver sin egen. Kaster paa timeout/refuse, saa kald() sluger det.
+     * Open a TCP/TLS connection with a hard deadline, so a server that never
+     * accepts/ACKs cannot hold us captive - the stream-context "timeout" does
+     * not cover the connection itself. We close it again straight away;
+     * file_get_contents makes its own. Throws on timeout/refuse, so request()
+     * swallows it.
      */
-    private function sikrOpkobling(string $url, float $frist): void
+    private function ensureConnection(string $url, float $deadline): void
     {
-        $dele = parse_url($url);
-        if ($dele === false || !isset($dele['host'])) {
-            return; // lad file_get_contents haandtere en misdannet URL
+        $parts = parse_url($url);
+        if ($parts === false || !isset($parts['host'])) {
+            return; // let file_get_contents handle a malformed URL
         }
-        $skema = $dele['scheme'] ?? 'http';
-        $vaert = $dele['host'];
-        $port = $dele['port'] ?? ($skema === 'https' ? 443 : 80);
-        $transport = $skema === 'https' ? 'ssl' : 'tcp';
+        $scheme = $parts['scheme'] ?? 'http';
+        $host = $parts['host'];
+        $port = $parts['port'] ?? ($scheme === 'https' ? 443 : 80);
+        $transport = $scheme === 'https' ? 'ssl' : 'tcp';
 
         $errno = 0;
         $errstr = '';
         $sock = @stream_socket_client(
-            "{$transport}://{$vaert}:{$port}",
+            "{$transport}://{$host}:{$port}",
             $errno,
             $errstr,
-            $frist,
+            $deadline,
             STREAM_CLIENT_CONNECT,
         );
         if ($sock === false) {
-            throw new \RuntimeException("batchwatch: kunne ikke koble op ({$errstr})");
+            throw new \RuntimeException("batchwatch: could not connect ({$errstr})");
         }
         fclose($sock);
     }
@@ -254,53 +262,54 @@ final class Client
     /**
      * @param list<string> $headers
      */
-    private function statusFraHeaders(array $headers): int
+    private function statusFromHeaders(array $headers): int
     {
         foreach ($headers as $h) {
             if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m) === 1) {
-                // Ved redirects kan der vaere flere status-linjer; den sidste
-                // vinder. ignore_errors=true + follow_location=0 giver os dog
-                // normalt kun een.
-                $sidste = (int) $m[1];
+                // On redirects there can be several status lines; the last one
+                // wins. ignore_errors=true + follow_location=0 normally leaves
+                // us with only one, though.
+                $last = (int) $m[1];
             }
         }
-        return $sidste ?? 0;
+        return $last ?? 0;
     }
 
     /**
-     * Koer en afsendelse "i baggrunden". PHP CLI har ingen aegte traade, saa
-     * det er synkront - men fejl bliver slugt, saa dette maa aldrig tage
-     * kalderens eget kald ned med sig. Se fil-headeren om traad-idiomet.
+     * Run a submission "in the background". PHP CLI has no real threads, so it
+     * is synchronous - but errors are swallowed, so this must never take the
+     * caller's own call down with it. See the file header on the thread idiom.
      *
-     * @param callable(): void $blok
+     * @param callable(): void $block
      */
-    public function iBaggrunden(callable $blok): void
+    public function inBackground(callable $block): void
     {
         if (!$this->enabled) {
             return;
         }
         try {
-            $blok();
+            $block();
         } catch (HttpError $e) {
             $this->debug("batchwatch {$e->status}: {$e->bodyText}");
         } catch (\Throwable $e) {
-            $this->debug('batchwatch utilgaengelig: ' . $e->getMessage());
+            $this->debug('batchwatch unavailable: ' . $e->getMessage());
         }
     }
 
     /**
-     * Findes for API-paritet med Python/Ruby. Afsendelser er synkrone i PHP,
-     * saa der er aldrig noget udestaaende at vente paa; returnerer altid true.
+     * Exists for API parity with Python/Ruby. Submissions are synchronous in
+     * PHP, so there is never anything outstanding to wait on; always returns
+     * true.
      */
     public function flush(float $timeout = 5.0): bool
     {
         return true;
     }
 
-    // ---------------------------------------------------------- beslutning
+    // ------------------------------------------------------------- decision
 
     /**
-     * Hvad koeen laver lige nu, eller null hvis vi ikke kan sige det.
+     * What the queue is doing right now, or null if we cannot say.
      *
      * @return array<string,mixed>|null
      */
@@ -308,25 +317,26 @@ final class Client
     {
         try {
             $q = http_build_query(['provider' => $provider, 'model' => $model, 'mode' => $mode]);
-            $r = $this->kald('/v1/wait?' . $q);
+            $r = $this->request('/v1/wait?' . $q);
             if (!$r || ($r['verdict'] ?? null) === 'insufficient_data') {
                 return null;
             }
             return $r;
         } catch (\Throwable $e) {
-            $this->debug('batchwatch wait fejlede: ' . $e->getMessage());
+            $this->debug('batchwatch wait failed: ' . $e->getMessage());
             return null;
         }
     }
 
     /**
-     * Hele dommen. Returnerer null hvis vi ikke kan svare.
+     * The full verdict. Returns null if we cannot answer.
      *
-     * output_tokens er som regel UKENDT paa dette tidspunkt - modellen
-     * bestemmer dem. Defaulten er derfor null, ikke nul. At sende nul ville faa
-     * serveren til at regne besparelsen paa nul output, og output koster fem
-     * til seks gange saa meget som input: svaret ville vaere systematisk for
-     * lavt, uden at nogen kan se det. Kender du et loft, saa send maxTokens.
+     * output_tokens is usually UNKNOWN at this point - the model decides them.
+     * The default is therefore null, not zero. Sending zero would make the
+     * server compute the saving on zero output, and output costs five to six
+     * times as much as input: the answer would be systematically too low,
+     * without anyone being able to see it. If you know a ceiling, pass
+     * maxTokens.
      *
      * @return array<string,mixed>|null
      */
@@ -344,31 +354,32 @@ final class Client
             'input_tokens' => $inputTokens,
             'output_tokens' => $outputTokens,
             'max_tokens' => $maxTokens,
-        ] as $navn => $vaerdi) {
-            if ($vaerdi !== null) {
-                $q[$navn] = (int) $vaerdi;
+        ] as $name => $value) {
+            if ($value !== null) {
+                $q[$name] = (int) $value;
             }
         }
         if ($maxWait !== null) {
             $q['max_wait'] = $maxWait;
         }
         try {
-            return $this->kald('/v1/should-i-batch?' . http_build_query($q));
+            return $this->request('/v1/should-i-batch?' . http_build_query($q));
         } catch (\Throwable $e) {
-            $this->debug('batchwatch advice fejlede: ' . $e->getMessage());
+            $this->debug('batchwatch advice failed: ' . $e->getMessage());
             return null;
         }
     }
 
     /**
-     * true/false. Ved enhver tvivl faar du din default tilbage.
+     * true/false. On any doubt you get your own default back.
      *
-     * Vi gaetter aldrig paa kalderens vegne: kan vi ikke svare, faar kalderen
-     * sin egen forudbestemte vaerdi. Defaulten er false - "koer det synkront" -
-     * som er den sikre maade at tage fejl paa, for et synkront kald koster bare
-     * mere, mens en uventet otte-timers koe kan tage et produkt ned.
+     * We never guess on the caller's behalf: if we cannot answer, the caller
+     * gets their own predetermined value. The default is false - "run it
+     * synchronously" - which is the safe way to be wrong, because a synchronous
+     * call just costs more, while an unexpected eight-hour queue can take a
+     * product down.
      *
-     * @param array<string,mixed> $kw ekstra advice()-argumenter (provider, inputTokens, ...)
+     * @param array<string,mixed> $kw extra advice() arguments (provider, inputTokens, ...)
      */
     public function shouldBatch(string $model, ?string $maxWait = null, bool $default = false, array $kw = []): bool
     {
@@ -384,58 +395,58 @@ final class Client
         if (!$r) {
             return $default;
         }
-        $svar = match ($r['verdict'] ?? null) {
+        $answer = match ($r['verdict'] ?? null) {
             'run_batch' => true,
             'run_sync', 'batch_at' => false,
             default => $default,
         };
-        $this->huskRaad($model, $svar, $maxWait, $r);
-        return $svar;
+        $this->rememberAdvice($model, $answer, $maxWait, $r);
+        return $answer;
     }
 
     /**
-     * Gem det raad vi lige gav for DENNE model (#101). Kun tal og vores egen
-     * beslutning ender her - intet brugerdata. De citerede percentiler tages
-     * fra serverens svar; mangler et af dem, gemmer vi null og haefter det
-     * simpelthen ikke paa (regel #30: intet opfundet 0).
+     * Store the advice we just gave for THIS model (#101). Only numbers and our
+     * own decision end up here - no user data. The quoted percentiles are taken
+     * from the server's answer; if one of them is missing, we store null and
+     * simply do not attach it (rule #30: no invented 0).
      *
-     * @param array<string,mixed> $svar
+     * @param array<string,mixed> $answer
      */
-    private function huskRaad(string $model, bool $actedVerdict, ?string $maxWait, array $svar): void
+    private function rememberAdvice(string $model, bool $actedVerdict, ?string $maxWait, array $answer): void
     {
-        $tal = static fn ($v): ?float => \is_int($v) || \is_float($v) ? (float) $v : null;
-        $this->raad[$model] = [
+        $number = static fn ($v): ?float => \is_int($v) || \is_float($v) ? (float) $v : null;
+        $this->advice[$model] = [
             'acted_verdict' => $actedVerdict,
-            'deadline_s' => sekunder($maxWait),
-            'quoted_p50_s' => $tal($svar['p50_s'] ?? null),
-            'quoted_p90_s' => $tal($svar['p90_s'] ?? null),
+            'deadline_s' => seconds($maxWait),
+            'quoted_p50_s' => $number($answer['p50_s'] ?? null),
+            'quoted_p90_s' => $number($answer['p90_s'] ?? null),
         ];
     }
 
     /**
-     * Det seneste raad for en model, eller null. Tilnaermelsen er
-     * seneste-raad-pr-model: det nyeste shouldBatch haefter paa den naeste
-     * afslutning af samme model.
+     * The latest advice for a model, or null. The approximation is
+     * latest-advice-per-model: the newest shouldBatch attaches to the next
+     * completion of the same model.
      *
      * @return array{acted_verdict:bool,deadline_s:?float,quoted_p50_s:?float,quoted_p90_s:?float}|null
      */
-    public function hentRaad(string $model): ?array
+    public function getAdvice(string $model): ?array
     {
-        return $this->raad[$model] ?? null;
+        return $this->advice[$model] ?? null;
     }
 
-    // ------------------------------------------------------------- maaling
+    // ---------------------------------------------------------- measurement
 
     /**
-     * Maal eet kald. Afsendelsen sker "i baggrunden" (synkront, men fejlfrit
-     * mod kalderen - se fil-headeren).
+     * Measure one call. The submission happens "in the background"
+     * (synchronously, but error-free towards the caller - see the file header).
      *
-     * Ingen undtagelse fra batchwatch naar nogensinde kalderen. Uden en
-     * callback returneres sporingen, og du kalder selv done(). Med en callback
-     * fungerer den som Python-kontekstmanageren: en undtagelse fra din egen
-     * blok optages som "failed" og kastes videre uroert.
+     * No exception from batchwatch ever reaches the caller. Without a callback
+     * the tracking is returned and you call done() yourself. With a callback it
+     * works like the Python context manager: an exception from your own block is
+     * recorded as "failed" and re-thrown untouched.
      *
-     * @param callable(Tracking): void|null $blok
+     * @param callable(Tracking): void|null $block
      */
     public function track(
         string $model,
@@ -444,21 +455,21 @@ final class Client
         int $requests = 1,
         ?int $inputTokens = null,
         ?string $endpoint = null,
-        ?callable $blok = null,
+        ?callable $block = null,
     ): Tracking {
         $t = new Tracking($this, $provider, $model, $mode, $requests, $inputTokens, $endpoint);
         $t->start();
-        if ($blok === null) {
+        if ($block === null) {
             return $t;
         }
         try {
-            $blok($t);
+            $block($t);
         } catch (\Throwable $e) {
-            // Vi sluger vores egne fejl, aldrig kalderens.
+            // We swallow our own errors, never the caller's.
             $t->done(status: 'failed');
             throw $e;
         }
-        if (!$t->afsluttet()) {
+        if (!$t->finished()) {
             $t->done();
         }
         return $t;
@@ -467,82 +478,87 @@ final class Client
     // --------------------------------------------------------------- spool
 
     /**
-     * Send alt der venter paa disken. Returnerer antallet accepteret.
+     * Send everything waiting on disk. Returns the number accepted.
      *
-     * Synkron og sikker at kalde fra en shutdown-hook. Kaster aldrig. Poster
-     * serveren afviser som ugyldige droppes - de bliver aldrig gyldige - og
-     * antallet logges.
+     * Synchronous and safe to call from a shutdown hook. Never throws. Records
+     * the server rejects as invalid are dropped - they never become valid - and
+     * the count is logged.
      */
     public function flushSpool(?float $timeout = null): int
     {
         if ($this->spool === null || !$this->enabled) {
             return 0;
         }
-        $poster = $this->spool->take();
-        if (empty($poster)) {
+        $records = $this->spool->take();
+        if (empty($records)) {
             return 0;
         }
-        $sendt = 0;
-        $rest = $poster;
+        $sent = 0;
+        $rest = $records;
         while (!empty($rest)) {
-            $gruppe = array_slice($rest, 0, MAX_BATCH);
+            $group = array_slice($rest, 0, MAX_BATCH);
             $rest = array_slice($rest, MAX_BATCH);
             try {
-                $r = $this->kald(
+                // The key is derived from the group itself: a replay after a
+                // crash chunks the records identically (the spool preserves
+                // order), so the key is the same and the server deduplicates the
+                // double write.
+                $r = $this->request(
                     '/v1/calls/complete',
                     'POST',
-                    array_values($gruppe),
+                    array_values($group),
                     $timeout ?? max($this->timeout, 10.0),
+                    idemComplete(array_values($group)),
                 );
             } catch (\Throwable $e) {
-                $this->debug('batchwatch: spool kunne ikke sendes: ' . $e->getMessage());
-                // Gruppen der fejlede bliver liggende sammen med resten.
-                $this->spool->keep(array_merge($gruppe, $rest));
-                return $sendt;
+                $this->debug('batchwatch: spool could not be sent: ' . $e->getMessage());
+                // The group that failed stays put together with the rest.
+                $this->spool->keep(array_merge($group, $rest));
+                return $sent;
             }
-            $sendt += (int) (($r ?? [])['accepted'] ?? 0);
-            $afvist = (int) (($r ?? [])['rejected'] ?? 0);
-            if ($afvist > 0) {
-                $this->debug("batchwatch: {$afvist} spoolede maalinger blev afvist og er droppet");
+            $sent += (int) (($r ?? [])['accepted'] ?? 0);
+            $rejected = (int) (($r ?? [])['rejected'] ?? 0);
+            if ($rejected > 0) {
+                $this->debug("batchwatch: {$rejected} spooled measurements were rejected and dropped");
             }
         }
         $this->spool->keep([]);
-        $this->debug("batchwatch: {$sendt} spoolede maalinger sendt");
-        return $sendt;
+        $this->debug("batchwatch: {$sent} spooled measurements sent");
+        return $sent;
     }
 
     /**
-     * Kaldes EFTER et vellykket kald - saa ved vi at netvaerket er oppe lige
-     * nu, og vi undgaar at hamre paa en server der alligevel ikke svarer.
+     * Called AFTER a successful call - so we know the network is up right now,
+     * and we avoid hammering a server that is not answering anyway.
      */
-    public function maaskeToemSpool(): void
+    public function maybeFlushSpool(): void
     {
         if ($this->spool === null) {
             return;
         }
-        $nu = $this->monotonic();
-        if ($nu - $this->spoolSidst < SPOOL_INTERVAL_S) {
+        $now = $this->monotonic();
+        if ($now - $this->spoolLast < SPOOL_INTERVAL_S) {
             return;
         }
-        $this->spoolSidst = $nu;
+        $this->spoolLast = $now;
         try {
             $this->flushSpool();
         } catch (\Throwable $e) {
-            $this->debug('batchwatch: spooltoemning fejlede: ' . $e->getMessage());
+            $this->debug('batchwatch: spool flush failed: ' . $e->getMessage());
         }
     }
 
     /**
-     * Gem en FAERDIG maaling der ikke kunne afleveres.
+     * Store a COMPLETED measurement that could not be delivered.
      *
-     * @param array<string,mixed> $krop
+     * @param array<string,mixed> $body
      */
-    public function spoolMaaling(array $krop): void
+    public function spoolMeasurement(array $body): void
     {
         if ($this->spool !== null) {
-            $this->spool->append($krop);
+            $this->spool->append($body);
         } else {
-            $this->debug('batchwatch: maalingen gik tabt (ingen spool)');
+            $this->debug('batchwatch: the measurement was lost (no spool)');
         }
     }
 
@@ -551,10 +567,10 @@ final class Client
         return hrtime(true) / 1_000_000_000.0;
     }
 
-    private function debug(string $besked): void
+    private function debug(string $message): void
     {
         if ($this->logger !== null) {
-            ($this->logger)($besked);
+            ($this->logger)($message);
         }
     }
 }

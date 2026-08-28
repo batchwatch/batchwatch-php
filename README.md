@@ -116,12 +116,12 @@ identical; only the mechanism (bounded-synchronous instead of a thread) differs.
 No prompts, no completions, no system prompts, no tool calls, no file names.
 The request body is built from a fixed allowlist — provider, model, mode,
 endpoint, request count, token counts, timestamps, status, ttfb, source — and
-everything else is dropped by `Batchwatch\rens()` on the way out. There is no
+everything else is dropped by `Batchwatch\sanitize()` on the way out. There is no
 field to put text in.
 
 `tests/test_no_content.php` asserts it on the bytes a real HTTP server
 received, and includes a positive control so the test cannot pass by the client
-simply sending nothing. The `rens()` unit tests are the guard you can point at
+simply sending nothing. The `sanitize()` unit tests are the guard you can point at
 when someone asks how you know a prompt cannot escape.
 
 ## `outputTokens` defaults to `null`, never `0`

@@ -5,9 +5,9 @@ declare(strict_types=1);
 namespace Batchwatch;
 
 /**
- * En ikke-2xx-svar. Naar aldrig kalderen af en offentlig metode - kun den
- * valgfri debug-logger. Egen fil, saa PSR-4 kan autoloade den hvis en kalder
- * vil catch'e den ved navn.
+ * A non-2xx response. Never reaches the caller of a public method - only the
+ * optional debug logger. Its own file, so PSR-4 can autoload it if a caller
+ * wants to catch it by name.
  */
 final class HttpError extends \RuntimeException
 {
