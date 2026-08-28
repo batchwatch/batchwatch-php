@@ -97,7 +97,11 @@ final class Tracking
         $this->afsluttet = true;
         $slut = (float) time();
 
-        $this->bw->iBaggrunden(function () use ($outputTokens, $status, $ttfbMs, $slut): void {
+        // Udfaldsmaalingen (#101): det seneste raad for DENNE model, haeftet paa
+        // afslutningen. Intet raad -> tom array -> felterne udelades helt.
+        $raad = udfaldsfelter($this->bw->hentRaad((string) $this->krop['model']));
+
+        $this->bw->iBaggrunden(function () use ($outputTokens, $status, $ttfbMs, $slut, $raad): void {
             $fuld = $this->krop;
             $fuld['input_tokens'] = $this->inputTokens;
             $fuld['output_tokens'] = $outputTokens;
@@ -107,15 +111,16 @@ final class Tracking
             if ($ttfbMs !== null) {
                 $fuld['ttfb_ms'] = $ttfbMs;
             }
+            $fuld = array_merge($fuld, $raad);
 
             if ($this->id !== null) {
                 try {
-                    $this->bw->kald('/v1/calls/' . $this->id, 'PATCH', rens([
+                    $this->bw->kald('/v1/calls/' . $this->id, 'PATCH', rens(array_merge([
                         'status' => $status,
                         'output_tokens' => $outputTokens,
                         'ttfb_ms' => $ttfbMs,
                         'ended_at' => iso($slut),
-                    ]));
+                    ], $raad)));
                     return;
                 } catch (\Throwable $e) {
                     // Serveren har allerede starten. En spoolet genindsendelse

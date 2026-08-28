@@ -76,6 +76,15 @@ final class Client
     private $logger;
     private ?Spool $spool;
     private float $spoolSidst = 0.0;
+    /**
+     * Sidste raad pr. model (#101). Naar shouldBatch svarer, gemmer vi her hvad
+     * vi anbefalede + de citerede percentiler, saa den NAESTE afslutning for
+     * samme model kan haefte dem paa. Korrelationen er en dokumenteret
+     * tilnaermelse: seneste-raad-pr-model, ikke pr-job.
+     *
+     * @var array<string, array{acted_verdict:bool,deadline_s:?float,quoted_p50_s:?float,quoted_p90_s:?float}>
+     */
+    private array $raad = [];
 
     /**
      * @param string|null $token   API-noegle. Falder tilbage til $BATCHWATCH_TOKEN.
@@ -375,11 +384,44 @@ final class Client
         if (!$r) {
             return $default;
         }
-        return match ($r['verdict'] ?? null) {
+        $svar = match ($r['verdict'] ?? null) {
             'run_batch' => true,
             'run_sync', 'batch_at' => false,
             default => $default,
         };
+        $this->huskRaad($model, $svar, $maxWait, $r);
+        return $svar;
+    }
+
+    /**
+     * Gem det raad vi lige gav for DENNE model (#101). Kun tal og vores egen
+     * beslutning ender her - intet brugerdata. De citerede percentiler tages
+     * fra serverens svar; mangler et af dem, gemmer vi null og haefter det
+     * simpelthen ikke paa (regel #30: intet opfundet 0).
+     *
+     * @param array<string,mixed> $svar
+     */
+    private function huskRaad(string $model, bool $actedVerdict, ?string $maxWait, array $svar): void
+    {
+        $tal = static fn ($v): ?float => \is_int($v) || \is_float($v) ? (float) $v : null;
+        $this->raad[$model] = [
+            'acted_verdict' => $actedVerdict,
+            'deadline_s' => sekunder($maxWait),
+            'quoted_p50_s' => $tal($svar['p50_s'] ?? null),
+            'quoted_p90_s' => $tal($svar['p90_s'] ?? null),
+        ];
+    }
+
+    /**
+     * Det seneste raad for en model, eller null. Tilnaermelsen er
+     * seneste-raad-pr-model: det nyeste shouldBatch haefter paa den naeste
+     * afslutning af samme model.
+     *
+     * @return array{acted_verdict:bool,deadline_s:?float,quoted_p50_s:?float,quoted_p90_s:?float}|null
+     */
+    public function hentRaad(string $model): ?array
+    {
+        return $this->raad[$model] ?? null;
     }
 
     // ------------------------------------------------------------- maaling

@@ -36,12 +36,18 @@ const MAX_BATCH = 500;
 const MAX_BYTES = 5 * 1024 * 1024;
 
 // Feltnavne der maa forlade maskinen. Alt andet findes ikke i kroppen.
-// Testen test_no_content.php holder listen fast. Samme tolv felter som
+// Testen test_no_content.php holder listen fast. Samme felter som
 // Python-, Ruby-, Go-, TypeScript- og .NET-klienterne.
+//
+// De fire sidste (acted_verdict, deadline_s, quoted_p50_s, quoted_p90_s) er
+// udfaldsmaalingen (#101): raadet vi selv gav, haeftet paa den senere
+// afslutning saa SERVEREN kan sammenholde sin egen maalte varighed med hvad vi
+// lovede. Alt er tal og en beslutning vi selv traf - ingen ny PII.
 const TILLADTE_FELTER = [
     'provider', 'model', 'mode', 'endpoint', 'requests',
     'input_tokens', 'output_tokens', 'started_at', 'ended_at',
     'status', 'ttfb_ms', 'source',
+    'acted_verdict', 'deadline_s', 'quoted_p50_s', 'quoted_p90_s',
 ];
 
 /**
@@ -60,6 +66,62 @@ function rens(array $krop): array
     foreach ($krop as $k => $v) {
         if (\in_array((string) $k, TILLADTE_FELTER, true)) {
             $ud[(string) $k] = $v;
+        }
+    }
+    return $ud;
+}
+
+/**
+ * Oversaet et max_wait til sekunder, eller null hvis vi ikke kan tyde det.
+ *
+ * Kalderen skriver typisk "15m", "1h", "30s" eller "2d" - samme sprog som
+ * /v1/should-i-batch selv tager imod. Et blankt tal laeses som sekunder. Kan
+ * vi ikke tyde det, sender vi hellere null end et gaet (regel #30).
+ */
+function sekunder(?string $maxWait): ?float
+{
+    if ($maxWait === null) {
+        return null;
+    }
+    $s = \strtolower(\trim($maxWait));
+    if ($s === '') {
+        return null;
+    }
+    $faktor = ['s' => 1.0, 'm' => 60.0, 'h' => 3600.0, 'd' => 86400.0];
+    $enhed = $s[\strlen($s) - 1];
+    if (isset($faktor[$enhed])) {
+        $tal = \substr($s, 0, -1);
+        $mult = $faktor[$enhed];
+    } else {
+        $tal = $s;
+        $mult = 1.0;
+    }
+    $tal = \trim($tal);
+    if ($tal === '' || !\is_numeric($tal)) {
+        return null;
+    }
+    return (float) $tal * $mult;
+}
+
+/**
+ * De felter fra et gemt raad der maa haeftes paa en afslutning (#101).
+ *
+ * Kun ikke-null vaerdier kommer med: mangler en percentil eller en frist,
+ * UDELADES feltet helt - vi opfinder ikke et nul (regel #30). Uden raad
+ * overhovedet er resultatet en tom array, saa ingenting haeftes paa.
+ *
+ * @param array{acted_verdict:bool,deadline_s:?float,quoted_p50_s:?float,quoted_p90_s:?float}|null $raad
+ * @return array<string,mixed>
+ */
+function udfaldsfelter(?array $raad): array
+{
+    if ($raad === null) {
+        return [];
+    }
+    $ud = ['acted_verdict' => $raad['acted_verdict']];
+    foreach (['deadline_s', 'quoted_p50_s', 'quoted_p90_s'] as $navn) {
+        if (($raad[$navn] ?? null) !== null) {
+            $ud[$navn] = $raad[$navn];
         }
     }
     return $ud;

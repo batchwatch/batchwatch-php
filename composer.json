@@ -3,31 +3,21 @@
     "description": "Client for batchwatch.dev - measure queue time on LLM batch APIs without ever blocking your job",
     "type": "library",
     "license": "MIT",
-    "keywords": [
-        "llm",
-        "batch",
-        "openai",
-        "anthropic",
-        "queue",
-        "latency",
-        "observability"
-    ],
+    "keywords": ["llm", "batch", "openai", "anthropic", "queue", "latency", "observability"],
     "homepage": "https://batchwatch.dev",
     "authors": [
-        {
-            "name": "Andreas Graae"
-        }
+        { "name": "Andreas Graae" }
     ],
     "support": {
-        "source": "https://github.com/batchwatch/batchwatch-php"
+        "source": "https://github.com/batchwatch/client"
     },
     "require": {
         "php": ">=8.2",
         "ext-json": "*"
     },
     "suggest": {
-        "ext-pcntl": "Only to run the bundled test suite (forked loopback servers); not used by the client itself",
-        "ext-posix": "Only for the test suite"
+        "ext-pcntl": "Kun til at koere den medfoelgende testsuite (forkede loopback-servere); ikke brugt af selve klienten",
+        "ext-posix": "Kun til testsuiten"
     },
     "autoload": {
         "psr-4": {

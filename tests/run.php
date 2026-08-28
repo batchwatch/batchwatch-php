@@ -14,6 +14,7 @@ $suiter = [
     __DIR__ . '/test_fail_open.php',
     __DIR__ . '/test_no_content.php',
     __DIR__ . '/test_spool.php',
+    __DIR__ . '/test_verdict_accuracy.php',
 ];
 
 $php = PHP_BINARY;
