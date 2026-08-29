@@ -23,7 +23,7 @@ if (\defined('Batchwatch\\VERSION')) {
     return;
 }
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 // How often, at most, we try to flush the spool on our own.
 const SPOOL_INTERVAL_S = 60.0;
@@ -165,14 +165,40 @@ function idemField(array $body, string $key): string
 }
 
 /**
+ * A short, stable content hash of a record. Hex SHA-256 (first 16 bytes) of the
+ * record's canonical JSON, serialised with the same flags the client sends on
+ * the wire - so the same record hashes to the same value every time, on every
+ * run, and a replay reconstructs it exactly. Printable ASCII, no control chars,
+ * well within the server's 255-char key limit.
+ *
+ * @param array<string,mixed> $body
+ */
+function contentHash(array $body): string
+{
+    $canonical = json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    return substr(hash('sha256', $canonical === false ? '' : $canonical), 0, 32);
+}
+
+/**
  * Per-record key for POST /v1/calls (the start call).
+ *
+ * Keeps the readable provider/model prefix for logs, then a content hash of the
+ * full (sanitized) start body. started_at is second-resolution, so two DISTINCT
+ * measurements of the same provider+model within one second would otherwise
+ * share a key - and the server refuses a reused key that carries a different
+ * body (409 body_differs), silently dropping the second measurement. Hashing
+ * the whole body keeps distinct measurements apart; an identical body (a retry
+ * or a die-and-reflush replay) still hashes the same and dedupes, so #30 holds.
+ * This key is only ever computed live at the start POST, never reconstructed
+ * from a spool line, so idemComplete's cross-client spool-replay key format is
+ * untouched.
  *
  * @param array<string,mixed> $body
  */
 function idemStart(array $body): string
 {
     return 'bw-start-' . idemField($body, 'provider') . '-' . idemField($body, 'model')
-        . '-' . idemField($body, 'started_at');
+        . '-' . contentHash($body);
 }
 
 /**

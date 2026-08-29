@@ -10,7 +10,7 @@ declare(strict_types=1);
 // standard installation.
 //
 //     require __DIR__ . '/clients/php/bootstrap.php';
-//     $bw = new Batchwatch\Client(token: 'tk_...');
+//     $bw = new Batchwatch\Client(token: 'bw_...');
 //
 // If you use Composer, require 'vendor/autoload.php' instead - that loads the
 // PSR-4 classes and the "files" free functions, and you do not need this file.

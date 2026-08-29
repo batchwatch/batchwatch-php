@@ -13,16 +13,9 @@ stream contexts, so it runs on a bare PHP with no extra modules.
 
 ## Install
 
-Not published to Packagist yet. Until it is, either point Composer at the
-subdirectory, or `require` the bootstrap directly.
+    composer require batchwatch/batchwatch
 
-**With Composer** (from a `composer.json` that references this repo):
-
-```json
-{
-  "autoload": { "psr-4": { "Batchwatch\\": "clients/php/src/" }, "files": ["clients/php/src/functions.php"] }
-}
-```
+On [Packagist](https://packagist.org/packages/batchwatch/batchwatch).
 
 **Without Composer** — vendor the four files under `src/` and require the
 bootstrap; they have no third-party imports:
@@ -39,7 +32,7 @@ so it runs on the bare standard library either way.
 ```php
 use Batchwatch\Client;
 
-$bw = new Client(token: 'tk_...');  // token optional; falls back to $BATCHWATCH_TOKEN
+$bw = new Client(token: 'bw_...');  // token optional; falls back to $BATCHWATCH_TOKEN
 
 // 1. before you submit — does this belong in the queue?
 if ($bw->shouldBatch('gpt-5.6-sol', maxWait: '15m')) {
@@ -138,6 +131,40 @@ back labelled as a ceiling.
 Passing `outputTokens: 0` really does send `0`: zero is a measurement, absence
 is not.
 
+## Read back your own calls and key status
+
+Two read routes, both keyed to your own token. They are the readback for
+`track()`: there is no route to a single call by id, so `myCalls()` is how you
+confirm a measurement landed after `track()` / `flushSpool()`.
+
+```php
+$bw = new Client(token: 'bw_...');
+
+// everything THIS key has contributed, newest page first
+$mine = $bw->myCalls();
+echo $mine['count'], " calls\n";
+foreach ($mine['calls'] as $call) {
+    echo $call['model'], ' ', $call['status'], ' ', $call['duration_s'], "\n";
+}
+// $mine['next'] is a ready-made relative URL for the next page (or null on the
+// last). Pagination is keyed on started_server, never an offset, so a row
+// arriving mid-walk cannot make you skip anything - follow "next" or pass
+// after=<unix seconds> until it is null.
+$mine = $bw->myCalls(after: 1787666964, limit: 100);
+
+// this key's tier, whether you are contributing, and your quota
+$status = $bw->keyStatus();
+echo $status['tier'], ' ', $status['quota']['calls_left'], "\n";
+```
+
+Both **require a key** and, unlike the measurement path, do **not** fail open —
+with no token there is nothing to read, so they throw `BatchwatchAuthError`
+rather than return an empty answer that reads like "no contributions". The
+server's row comes back verbatim, keys and all. `myCalls`'s `after` (unix
+seconds; only rows whose `started_server` is strictly greater) and `limit`
+(clamped server-side to 1–1000, default 500) are both optional and sent only
+when given.
+
 ## Spooling
 
 When a measurement cannot be delivered, the completed record is appended to a
@@ -197,6 +224,8 @@ in CI.
   - `$t->done(?int $outputTokens = null, string $status = 'completed', ?int $ttfbMs = null): void`
   - `$t->failed(string $status = 'failed'): void`
   - `$t->started(?int $inputTokens = null): void` — when the count is only known after submission
+- `myCalls(?int $after = null, ?int $limit = null): ?array` — this key's own contributions (`GET /v1/calls/mine`); the readback for `track()`, follows `next`/`after` for pagination; requires a key, does not fail open
+- `keyStatus(): ?array` — this key's tier / contribution status / quota (`GET /v1/keys/current`); requires a key, does not fail open
 - `flush(float $timeout = 5.0): bool` — parity no-op in PHP (always `true`; there is no background work to await)
 - `flushSpool(?float $timeout = null): int` — send what is on disk, returns accepted
 
@@ -206,7 +235,7 @@ in CI.
     # or a single suite:
     php tests/test_fail_open.php
 
-28 tests, no network beyond loopback. They start real HTTP servers on
+32 tests, no network beyond loopback. They start real HTTP servers on
 ephemeral ports (raw `stream_socket_server`, port 0, in a forked child via
 `pcntl_fork`) rather than stubbing the stream layer: the thing under test is
 network behaviour, so the network should be in the test. The allowlist and
@@ -217,19 +246,9 @@ writers so the `flock` guard is exercised for real.
 The runner and the fake-server harness use `pcntl`/`posix` — that is a **test**
 requirement only. The client itself uses neither.
 
-## What is not verified
+## Requirements
 
-- **No live round-trip.** The suite runs against loopback servers and a fake
-  batchwatch; the request shapes were mirrored from the verified Python and
-  Ruby clients, not confirmed against a running batchwatch worker.
-- **PHP 8.2.32 only.** `composer.json` claims `>=8.2` on the strength of the
-  syntax used, not a test matrix. Only 8.2.32 has actually been run.
-- **Not on Packagist.** No `composer validate`/publish has been performed; the
-  `composer.json` is written but publishing is unverified. The tests run
-  without `composer install` by design.
-- **The no-threads idiom is a real behavioural difference** from the other
-  clients (see above): fail-open is preserved, but submissions are
-  bounded-synchronous rather than off-thread.
+Requires PHP 8.2 or newer. Tested on 8.2.
 
 ## Licence
 

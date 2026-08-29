@@ -82,7 +82,7 @@ $h->test('sanitize drops everything outside the list', function (Harness $t): vo
 });
 
 $h->test('sanitize keeps order and only allowed keys', function (Harness $t): void {
-    // Robustness: even if the body is full of unknown fields, only the twelve
+    // Robustness: even if the body is full of unknown fields, only the sixteen
     // may slip out, regardless of order.
     $out = sanitize([
         'endpoint' => '/v1/chat',

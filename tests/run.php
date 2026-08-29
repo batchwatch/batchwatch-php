@@ -15,6 +15,7 @@ $suites = [
     __DIR__ . '/test_spool.php',
     __DIR__ . '/test_verdict_accuracy.php',
     __DIR__ . '/test_idempotency.php',
+    __DIR__ . '/test_read_own.php',
 ];
 
 $php = PHP_BINARY;

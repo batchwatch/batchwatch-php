@@ -122,4 +122,28 @@ $h->test("the key is deterministic and honours the server's contract", function 
     }
 });
 
+$h->test('two distinct measurements in one second get DIFFERENT start keys', function (Harness $t): void {
+    // Regression for the live 409 body_differs collision: started_at is
+    // second-resolution, so two DISTINCT same-second measurements of the same
+    // provider+model must NOT share a start key, or the server refuses the
+    // second write and it is lost. Same key + different body is exactly what the
+    // server rejects.
+    $rec = fn (int $inputTokens): array => [
+        'provider' => 'openai', 'model' => 'gpt-5.6-sol', 'mode' => 'batch',
+        'started_at' => '2026-08-25T10:00:00Z', 'input_tokens' => $inputTokens,
+    ];
+
+    $ka = idemStart($rec(100));
+    $kb = idemStart($rec(999));
+    $t->assertTrue(str_starts_with($ka, 'bw-start-') && str_starts_with($kb, 'bw-start-'),
+        "keys lost the readable prefix: {$ka} / {$kb}");
+    $t->assertTrue($ka !== $kb,
+        "two distinct same-second measurements shared a start key ({$ka}) - "
+        . 'the server would 409 the second and drop it');
+
+    // An identical body still hashes to the same key (retry / replay dedup).
+    $t->assertEquals($ka, idemStart($rec(100)),
+        'an identical body produced a different key - dedup would break');
+});
+
 exit($h->run());

@@ -29,7 +29,7 @@ declare(strict_types=1);
 //
 //     use Batchwatch\Client;
 //
-//     $bw = new Client(token: 'tk_...');            // token is optional
+//     $bw = new Client(token: 'bw_...');            // token is optional
 //
 //     // 1) before you submit: does this belong in the queue?
 //     if ($bw->shouldBatch('gpt-5.6-sol', maxWait: '15m')) {
@@ -50,10 +50,11 @@ namespace Batchwatch;
 // and PSR-4 (which only autoloads classes) does not leave them undefined.
 // require_once is idempotent - composer may have loaded it already.
 require_once __DIR__ . '/functions.php';
-// HttpError and Tracking live in their own files (clean PSR-4), but we load
-// them here too, so bootstrap.php without composer still works. require_once is
-// idempotent.
+// HttpError, BatchwatchAuthError and Tracking live in their own files (clean
+// PSR-4), but we load them here too, so bootstrap.php without composer still
+// works. require_once is idempotent.
 require_once __DIR__ . '/HttpError.php';
+require_once __DIR__ . '/BatchwatchAuthError.php';
 require_once __DIR__ . '/Tracking.php';
 
 /**
@@ -473,6 +474,84 @@ final class Client
             $t->done();
         }
         return $t;
+    }
+
+    // ----------------------------------------------------- read your own key
+
+    /**
+     * The measurements THIS key has contributed. Requires a key.
+     *
+     * GET /v1/calls/mine returns everything the service holds that came from
+     * your key - the only readback there is: there is no route to a single call
+     * by id, and none to anyone else's rows. Use it to verify a measurement
+     * landed after track() / flushSpool().
+     *
+     * Returns the server's row verbatim - {"label", "count", "next", "calls":
+     * [...], "note"} - keys and all. "next" is a ready-made relative URL for the
+     * following page ("null" on the last), keyed on started_server so a walk
+     * cannot skip a row that arrives mid-walk.
+     *
+     * @param int|null $after unix seconds; only rows whose started_server is
+     *                        strictly greater come back. Omit for the first page.
+     * @param int|null $limit rows per page, clamped server-side to 1-1000
+     *                        (default 500). Omit to take the default.
+     *
+     * Like the write paths this does NOT fail open: the route is per-key, so
+     * without one we throw BatchwatchAuthError rather than pretend.
+     *
+     * @return array<string,mixed>|null
+     */
+    public function myCalls(?int $after = null, ?int $limit = null): ?array
+    {
+        $this->requireKey('myCalls');
+        $q = [];
+        if ($after !== null) {
+            $q['after'] = $after;
+        }
+        if ($limit !== null) {
+            $q['limit'] = $limit;
+        }
+        $path = '/v1/calls/mine';
+        if (!empty($q)) {
+            $path .= '?' . http_build_query($q);
+        }
+        return $this->request($path);
+    }
+
+    /**
+     * THIS key's tier, contribution status and quota. Requires a key.
+     *
+     * GET /v1/keys/current returns the row verbatim - {"label", "tier",
+     * "contributing", "recent_measurements", "required", "window_days",
+     * "delayed_by_s", "live", "quota": {"calls_used", "calls_limit",
+     * "calls_left", "window"}}. "tier" is the effective tier derived from your
+     * measurements ("free" / "contributor"; only "paid" is operator-assigned),
+     * and "quota" reports the calls window for the gated routes.
+     *
+     * Like myCalls() this does NOT fail open: without a key there is no key to
+     * describe, so we throw BatchwatchAuthError.
+     *
+     * @return array<string,mixed>|null
+     */
+    public function keyStatus(): ?array
+    {
+        $this->requireKey('keyStatus');
+        return $this->request('/v1/keys/current');
+    }
+
+    /**
+     * Throw clearly when there is no key. These read routes are per-key -
+     * without one there is nothing to read, so a silent empty answer would read
+     * like "no contributions" and mislead the caller.
+     */
+    private function requireKey(string $action): void
+    {
+        if ($this->token === null) {
+            throw new BatchwatchAuthError(
+                "batchwatch: {$action} requires a key - set token: ... or "
+                . '$BATCHWATCH_TOKEN',
+            );
+        }
     }
 
     // --------------------------------------------------------------- spool
